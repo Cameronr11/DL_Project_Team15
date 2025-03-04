@@ -11,6 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data_loader import MRNetDataset
 import time
 import glob
+from data_loader import custom_collate
 
 def get_project_root():
     """Returns the absolute path to the project root directory"""
@@ -104,36 +105,6 @@ def check_data_structure():
             examples = [os.path.basename(f) for f in csv_files]
             print(f"CSV files: {', '.join(examples)}")
 
-def custom_collate(batch):
-    """
-    Custom collate function that handles batches with varying available views.
-    Only include views that are available in all samples in the batch.
-    """
-    # Find common views available in all samples
-    available_in_all = {'axial', 'coronal', 'sagittal'}
-    for sample in batch:
-        available_in_sample = set(sample['available_views'])
-        available_in_all = available_in_all.intersection(available_in_sample)
-    
-    # If no common views, create empty batch with just labels and case_ids
-    if not available_in_all:
-        labels = torch.stack([sample['label'] for sample in batch])
-        case_ids = [sample['case_id'] for sample in batch]
-        return {'label': labels, 'case_id': case_ids, 'available_views': []}
-    
-    # Create batch with only common views
-    result = {
-        'label': torch.stack([sample['label'] for sample in batch]),
-        'case_id': [sample['case_id'] for sample in batch],
-        'available_views': list(available_in_all)
-    }
-    
-    # Add tensors for common views
-    for view in available_in_all:
-        result[view] = torch.stack([sample[view] for sample in batch])
-    
-    return result
-
 def test_mrnet_dataset():
     # First check data directory structure
     check_data_structure()
@@ -185,5 +156,41 @@ def test_mrnet_dataset():
     except Exception as e:
         print(f"Error loading batch: {e}")
 
+def test_custom_collate():
+    """Test the custom collate function"""
+    # Create a small dataset
+    dataset = MRNetDataset(
+        root_dir=os.getcwd(),
+        task='abnormal',
+        train=True
+    )
+    
+    # Create a batch with mixed views
+    batch = [
+        dataset[0],  # First sample
+        dataset[1],  # Second sample
+        dataset[2]   # Third sample
+    ]
+    
+    # Apply custom collate
+    result = custom_collate(batch)
+    
+    # Verify the structure
+    assert 'label' in result
+    assert 'case_id' in result
+    assert 'available_views' in result
+    
+    # Verify shapes
+    assert result['label'].shape[0] == len(batch)
+    assert len(result['case_id']) == len(batch)
+    
+    # Verify view tensors
+    for view in result['available_views']:
+        assert view in result
+        assert isinstance(result[view], torch.Tensor)
+    
+    print("Custom collate test passed!")
+
 if __name__ == "__main__":
     test_mrnet_dataset()
+    test_custom_collate()

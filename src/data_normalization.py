@@ -97,46 +97,51 @@ def test_preprocessed_format(file_path, expected_slice_shape=(3, 224, 224)):
 
 if __name__ == '__main__':
     # Define source and destination directories
-    data_dir = os.path.join('..', 'data', 'MRNet-v1.0', 'train')  # Adjust as needed
-    processed_dir = 'processed_data'
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    mrnet_dir = os.path.join(project_root, 'data', 'MRNet-v1.0')
     
-    # Create the main processed_data directory
-    os.makedirs(processed_dir, exist_ok=True)
-    
-    # List of folders to process (e.g., axial, coronal, sagittal)
-    folders = ['axial', 'coronal', 'sagittal']
-    
-    # Process each folder
-    for folder in folders:
-        source_folder = os.path.join(data_dir, folder)
-        processed_folder = os.path.join(processed_dir, folder)
-        os.makedirs(processed_folder, exist_ok=True)
+    # Process both training and validation data
+    for split in ['train', 'valid']:
+        source_dir = os.path.join(mrnet_dir, split)
+        processed_dir = os.path.join(mrnet_dir, f'processed_{split}_data')
         
-        # Process each file in the folder
-        for filename in os.listdir(source_folder):
-            if filename.endswith('.npy'):
-                input_path = os.path.join(source_folder, filename)
-                output_path = os.path.join(processed_folder, filename)
-                
-                try:
-                    # Print the original file size
-                    original_volume = np.load(input_path)
-                    print(f"Processing {filename}, original shape: {original_volume.shape}")
+        # Create the processed data directory
+        os.makedirs(processed_dir, exist_ok=True)
+        
+        # List of folders to process (e.g., axial, coronal, sagittal)
+        folders = ['axial', 'coronal', 'sagittal']
+        
+        # Process each folder
+        for folder in folders:
+            source_folder = os.path.join(source_dir, folder)
+            processed_folder = os.path.join(processed_dir, folder)
+            os.makedirs(processed_folder, exist_ok=True)
+            
+            # Process each file in the folder
+            for filename in os.listdir(source_folder):
+                if filename.endswith('.npy'):
+                    input_path = os.path.join(source_folder, filename)
+                    output_path = os.path.join(processed_folder, filename)
                     
-                    # Process the MRI series
-                    processed_volume = process_series(input_path, target_shape=(224, 224), approach='2D', channels=3)
-                    print(f"Processed shape: {processed_volume.shape}, size: {processed_volume.nbytes / (1024*1024):.2f} MB")
-                    
-                    # Save the processed volume as a .npy file
-                    np.save(output_path, processed_volume)
-                    print(f"Processed and saved: {output_path}")
-                except Exception as e:
-                    print(f"Error processing {filename}: {str(e)}")
-                    continue
-    
-    # Test one of the preprocessed files (adjust the filename as needed)
-    test_file_path = os.path.join(processed_dir, 'axial', '0029.npy')
-    if os.path.exists(test_file_path):
-        test_preprocessed_format(test_file_path, expected_slice_shape=(3, 224, 224))
-    else:
-        print(f"Sample file {test_file_path} not found.")
+                    try:
+                        # Print the original file size
+                        original_volume = np.load(input_path)
+                        print(f"Processing {filename}, original shape: {original_volume.shape}")
+                        
+                        # Process the MRI series
+                        processed_volume = process_series(input_path, target_shape=(224, 224), approach='2D', channels=3)
+                        print(f"Processed shape: {processed_volume.shape}, size: {processed_volume.nbytes / (1024*1024):.2f} MB")
+                        
+                        # Save the processed volume as a .npy file
+                        np.save(output_path, processed_volume)
+                        print(f"Processed and saved: {output_path}")
+                    except Exception as e:
+                        print(f"Error processing {filename}: {str(e)}")
+                        continue
+        
+        # Test one of the preprocessed files
+        test_file_path = os.path.join(processed_dir, 'axial', '0029.npy')
+        if os.path.exists(test_file_path):
+            test_preprocessed_format(test_file_path, expected_slice_shape=(3, 224, 224))
+        else:
+            print(f"Sample file {test_file_path} not found.")
