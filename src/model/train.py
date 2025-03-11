@@ -110,7 +110,7 @@ def train_model(args):
                 raise ValueError(f"Invalid view: {args.view}. Choose from 'axial', 'coronal', 'sagittal'")
             models = {args.view: models[args.view]}
             optimizers = {args.view: optimizers[args.view]}
-            
+    #Ensemble Method is not working        
     elif args.train_approach == 'ensemble':
         # Train ensemble model
         model = MRNetEnsemble(backbone=args.backbone)
@@ -161,7 +161,7 @@ def train_model(args):
                     # Backward pass
                     loss.backward()
                     optimizer.step()
-                    
+                # Ensemble Method is not working    
                 elif args.train_approach == 'ensemble':
                     # For ensemble training, pass all views
                     data_dict = {view: batch[view].to(device) for view in batch['available_views']}
@@ -219,7 +219,7 @@ def train_model(args):
                         
                         data = batch[model_name].to(device)
                         outputs = model(data)
-                        
+                    #Ensemble Method is not working    
                     elif args.train_approach == 'ensemble':
                         # For ensemble validation, pass all views
                         data_dict = {view: batch[view].to(device) for view in batch['available_views']}
