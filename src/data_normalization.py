@@ -3,6 +3,15 @@ import numpy as np
 import cv2
 import torch
 
+"""
+We need to look into Data Augmentation and how it can be used to improve the model
+Currently we are just taking the .npy files and converting them to a numpy array in a 
+cohesive format, this may not be the best way to do this and we should look into other
+methods to ensure that the data is in the best format for the model.
+
+
+
+"""
 def process_series(npy_path, target_shape=(224, 224), approach='2D', channels=3):
     """
     Load and preprocess an MRI series from a .npy file.
@@ -60,6 +69,8 @@ def process_series(npy_path, target_shape=(224, 224), approach='2D', channels=3)
     
     return processed_volume
 
+
+#Probably can delete this below I just want a way to test the format of the data after it is processed
 def test_preprocessed_format(file_path, expected_slice_shape=(3, 224, 224)):
     """
     Test a preprocessed file by loading it, verifying its dimensions,

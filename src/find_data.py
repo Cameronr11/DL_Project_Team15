@@ -2,6 +2,9 @@ import os
 import glob
 import sys
 
+
+#Helper file to find the data files and directories
+#It also allow us to run the script from any directory in one of the other files
 def get_project_root():
     """Returns the absolute path to the project root directory"""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -5,6 +5,14 @@ import os
 import glob
 from torch.utils.data import Dataset, DataLoader
 
+
+#IF this is not setup correctly the entire model will fail, so it is important to get this right
+#We need to go through this whole file and ensure that the data is loaded in the correct format
+#This is the main file that will be used to load the data for the model
+
+
+
+
 class MRNetDataset(Dataset):
     """
     Dataset for MRNet knee MRI data.
@@ -156,7 +164,7 @@ class MRNetDataset(Dataset):
                 print(f"Warning: No views available for case {case_id}")
         
         return result
-    
+    #this is created in another file as well see if we need the duplicate function
     def custom_collate(batch):
         """
         Custom collate function for DataLoader with variable slices.
