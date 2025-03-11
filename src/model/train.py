@@ -1,7 +1,7 @@
 import sys
 import os
 
-# Add the project root directory to Python path
+# Add the project root directory to Python path, this makes sure you can run it from any directory
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
 
@@ -24,6 +24,7 @@ def get_project_root():
     """Returns the absolute path to the project root directory"""
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+#for if we want to try training on a GPU
 def verify_gpu():
     """Verify GPU availability and print information"""
     print("\n=== GPU Information ===")
@@ -51,7 +52,7 @@ def train_model(args):
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Set up tensorboard
+    # Set up tensorboard, see if we need this or what it does for us - Cam
     writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'tensorboard'))
     
     # Create datasets
@@ -92,6 +93,7 @@ def train_model(args):
     )
     
     # Create model based on training approach
+    #Here we are going to train a separate model for each view, this is a single view training approach, working on ensemble method - Cam
     if args.train_approach == 'per_view':
         # Train a separate model for each view
         models = {}
@@ -100,6 +102,8 @@ def train_model(args):
         for view in ['axial', 'coronal', 'sagittal']:
             model = MRNetModel(backbone=args.backbone)
             model = model.to(device)
+            #Using the adam optimizer, this is a popular optimizer for training neural networks, INVESTIGATE - Cam
+            #Also look at parameters learning rate and weight decay
             optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
             models[view] = model
             optimizers[view] = optimizer
@@ -122,9 +126,10 @@ def train_model(args):
         raise ValueError(f"Invalid training approach: {args.train_approach}")
     
     # Loss function
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss() #This is Binary Cross Entropy with Logits, INVESTIGATE - Cam
     
     # Training loop
+    #Best AUC is the best area under the curve, this is a common metric for binary classification problems, INVESTIGATE - Cam
     best_auc = {model_name: 0.0 for model_name in models}
     
     for epoch in range(args.epochs):
@@ -132,8 +137,8 @@ def train_model(args):
         for model_name, model in models.items():
             model.train()
             running_loss = 0.0
-            train_pred = []
-            train_true = []
+            train_pred = [] #stores the predicted values
+            train_true = [] #stores the true values
             
             for i, batch in enumerate(train_loader):
                 # Skip batches without required views
@@ -150,16 +155,21 @@ def train_model(args):
                     if model_name not in batch['available_views']:
                         continue
                     
+                    #pushing the data to the device (CPU/GPU)
                     data = batch[model_name].to(device)
+                    #Setting optimizer for the current model
                     optimizer = optimizers[model_name]
                     
                     # Forward pass
+                    #How much is the gradient effecting the model, INVESTIGATE - Cam
                     optimizer.zero_grad()
                     outputs = model(data)
+                    #Investigate this loss function, INVESTIGATE - Cam
                     loss = criterion(outputs, labels)
                     
                     # Backward pass
                     loss.backward()
+                    #step function INVESTIGATE - Cam
                     optimizer.step()
                 # Ensemble Method is not working    
                 elif args.train_approach == 'ensemble':
@@ -180,6 +190,7 @@ def train_model(args):
                     optimizer.step()
                 
                 # Update metrics
+                #BELOW NEEDS CHANGED TO HOW WE WILL BE EVALUATING THE MODEL
                 running_loss += loss.item()
                 train_pred.extend(torch.sigmoid(outputs).cpu().detach().numpy())
                 train_true.extend(labels.cpu().numpy())
@@ -190,11 +201,14 @@ def train_model(args):
                     running_loss = 0.0
             
             # Calculate train AUC
+            #IF this is the method we want to use to evaluate the model, INVESTIGATE - Cam
             train_auc = roc_auc_score(train_true, train_pred)
             print(f'{model_name} Train AUC: {train_auc:.3f}')
             writer.add_scalar(f'{model_name}/train_auc', train_auc, epoch)
         
         # Validation phase
+        #Now running the validation phase, this is where we evaluate the model on the validation set
+        #Essentially a copy of the training phase, but we are not updating the model parameters
         with torch.no_grad():
             for model_name, model in models.items():
                 model.eval()
@@ -264,7 +278,17 @@ def train_model(args):
     writer.close()
 
 def custom_collate(batch):
-    """Custom collate function for DataLoader with variable slices"""
+    """
+    Combines multiple MRI scans into a single batch for training, handling cases
+    where scans might be missing certain views (top, front, or side). This is
+    to ensure that every sample has all three views and if not handles this case.
+    
+    Args:
+        batch: List of MRI scans with their labels and available views
+        
+    Returns:
+        Combined batch of MRI data ready for model training
+    """
     # Find common views available in all samples
     available_in_all = set(['axial', 'coronal', 'sagittal'])
     for sample in batch:
@@ -291,6 +315,10 @@ def custom_collate(batch):
     
     return result
 
+#allows us to run the script from the command line and set all the appropriate parameters
+
+# To run use something like this: python train.py --data_dir "path/to/data" --task "abnormal" --view "axial" --backbone "alexnet" --train_approach "per_view" --batch_size 8 --epochs 50 --lr 1e-5 --weight_decay 1e-4 --num_workers 4 --output_dir "model_outputs" --no_cuda --gpu 0
+#Can run without some of these flags
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train MRNet models')
     

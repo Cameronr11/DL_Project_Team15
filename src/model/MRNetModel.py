@@ -12,7 +12,7 @@ class MRNetModel(nn.Module):
     def __init__(self, backbone='alexnet'):
         super(MRNetModel, self).__init__()
         
-        # Load the pretrained backbone
+        #Choosing pretrained base models here for image classification make sure these decisions are optimal -Cam
         if backbone == 'alexnet':
             self.backbone = models.alexnet(pretrained=True)
             feature_dim = 256 * 6 * 6  # AlexNet's output dimension
@@ -22,7 +22,8 @@ class MRNetModel(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
         
-        # Remove the classification head
+
+        #There could be improvments make the feature extractor will investigate - Cam
         if backbone == 'alexnet':
             self.feature_extractor = self.backbone.features
         else:  # For ResNet, keep everything except the final FC layer
@@ -31,10 +32,11 @@ class MRNetModel(nn.Module):
         # Global average pooling for variable slice count
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         
-        # MLP classifier
+        # This is building the Multi-Layer Perceptron (MLP) classifier
+        #I feel like there are improvments/options for this piece below it is very important
         self.classifier = nn.Sequential(
             nn.Linear(feature_dim, 1024),
-            nn.ReLU(),
+            nn.ReLU(), #RELU activation function
             nn.Dropout(0.5),
             nn.Linear(1024, 1)
         )
@@ -50,6 +52,8 @@ class MRNetModel(nn.Module):
         Returns:
             Tensor of shape [batch_size, 1] with the abnormality prediction
         """
+
+        #Setting the tensor shape which will allow us to process all slices as a batch below
         batch_size, num_slices, channels, height, width = x.shape
         
         # Reshape to process all slices as a batch
@@ -67,6 +71,7 @@ class MRNetModel(nn.Module):
             features = features.view(batch_size, num_slices, 512, 1, 1)
         
         # Global max pooling across slices
+        #This is a way to reduce the dimensionality of the features and keep the most important information, INVESTIGATE - Cam
         features = torch.max(features, dim=1)[0]
         
         # Flatten the features
