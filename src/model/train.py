@@ -334,7 +334,7 @@ if __name__ == "__main__":
     
     # Model parameters
     parser.add_argument('--backbone', type=str, default='alexnet',
-                        choices=['alexnet', 'resnet18'],
+                        choices=['alexnet', 'resnet18', 'densenet121'],
                         help='Backbone architecture')
     parser.add_argument('--train_approach', type=str, default='per_view',
                         choices=['per_view', 'ensemble'],

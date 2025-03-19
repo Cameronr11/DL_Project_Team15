@@ -19,6 +19,9 @@ class MRNetModel(nn.Module):
         elif backbone == 'resnet18':
             self.backbone = models.resnet18(pretrained=True)
             feature_dim = 512  # ResNet18's output dimension
+        elif backbone == 'densenet121':
+            self.backbone = models.densenet121(pretrained=True)
+            feature_dim = self.backbone.classifier.in_features  # DenseNet specific
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
         
@@ -26,7 +29,9 @@ class MRNetModel(nn.Module):
         #There could be improvments make the feature extractor will investigate - Cam
         if backbone == 'alexnet':
             self.feature_extractor = self.backbone.features
-        else:  # For ResNet, keep everything except the final FC layer
+        elif backbone == 'densenet121':
+            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
+        else:  # For ResNet
             self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
         
         # Global average pooling for variable slice count
@@ -64,10 +69,10 @@ class MRNetModel(nn.Module):
         
         # Reshape back to separate batches and slices
         if isinstance(self.backbone, models.AlexNet):
-            # For AlexNet
             features = features.view(batch_size, num_slices, 256, 6, 6)
-        else:
-            # For ResNet
+        elif isinstance(self.backbone, models.DenseNet):
+            features = features.view(batch_size, num_slices, self.backbone.classifier.in_features, 1, 1)
+        else:  # For ResNet
             features = features.view(batch_size, num_slices, 512, 1, 1)
         
         # Global max pooling across slices
