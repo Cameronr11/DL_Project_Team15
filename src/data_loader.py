@@ -4,6 +4,7 @@ import numpy as np
 import os
 import glob
 from torch.utils.data import Dataset, DataLoader
+from src.data_augmentation import SimpleMRIAugmentation
 
 
 #IF this is not setup correctly the entire model will fail, so it is important to get this right
@@ -33,7 +34,12 @@ class MRNetDataset(Dataset):
         self.root_dir = root_dir
         self.task = task
         self.train = train
-        self.transform = transform
+        
+        # Add simple augmentation only for training
+        if train:
+            self.transform = SimpleMRIAugmentation(p=0.5)
+        else:
+            self.transform = None
         
         # Set up paths
         split = 'train' if train else 'valid'
@@ -135,7 +141,8 @@ class MRNetDataset(Dataset):
                 try:
                     data = np.load(file_path)
                     tensor = torch.from_numpy(data)
-                    if self.transform:
+                    # Apply augmentation only during training
+                    if self.train and self.transform:
                         tensor = self.transform(tensor)
                     result[view] = tensor
                     result['available_views'].append(view)
@@ -150,7 +157,8 @@ class MRNetDataset(Dataset):
                     try:
                         data = np.load(path)
                         tensor = torch.from_numpy(data)
-                        if self.transform:
+                        # Apply augmentation only during training
+                        if self.train and self.transform:
                             tensor = self.transform(tensor)
                         result[view] = tensor
                         result['available_views'].append(view)
