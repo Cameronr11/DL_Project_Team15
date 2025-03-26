@@ -12,7 +12,7 @@ methods to ensure that the data is in the best format for the model.
 
 
 """
-def process_series(npy_path, target_shape=(224, 224), approach='2D', channels=3):
+def process_series(npy_path, target_shape=(224, 224), approach='2D', channels=3, max_slices=None):
     """
     Load and preprocess an MRI series from a .npy file.
     
@@ -24,6 +24,7 @@ def process_series(npy_path, target_shape=(224, 224), approach='2D', channels=3)
         target_shape (tuple): Desired (height, width) of each slice.
         approach (str): '2D' to prepare for slice-based models.
         channels (int): Number of channels expected by the model.
+        max_slices (int, optional): Maximum number of slices to keep. If None, keep all slices.
     
     Returns:
         processed_volume (np.array):
@@ -36,6 +37,12 @@ def process_series(npy_path, target_shape=(224, 224), approach='2D', channels=3)
     # I DONT KNOW IF THIS IF STATEMENT IS NECESSARY BECUASE DATA IS ALREADY IN THE CORRECT FORMAT
     if volume.ndim == 3 and volume.shape[-1] > 3:
         volume = np.transpose(volume, (2, 0, 1))  # Now shape is (num_slices, H, W)
+    
+    # Apply max_slices limit if specified
+    if max_slices is not None and volume.shape[0] > max_slices:
+        # Take center slices as they typically contain the most relevant information
+        start = max(0, (volume.shape[0] - max_slices) // 2)
+        volume = volume[start:start+max_slices]
     
     processed_slices = []
     for slice_img in volume:

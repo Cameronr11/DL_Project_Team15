@@ -1,9 +1,29 @@
+"""
+MRNet Dataset Loader
+
+This module handles loading and preprocessing of MRI knee scan data for the MRNet project.
+It provides a PyTorch Dataset for working with single-view MRI data.
+
+Key components:
+- MRNetDataset: PyTorch Dataset for loading MRI data from a specific view (axial, coronal, or sagittal)
+- Custom collation function: For handling variable-sized MRI volumes in batches
+- Utility functions: For easily creating properly configured data loaders
+"""
+
 import torch
 import pandas as pd
 import numpy as np
 import os
 import glob
 from torch.utils.data import Dataset, DataLoader
+from src.data_augmentation import SimpleMRIAugmentation
+from sklearn.model_selection import train_test_split
+import json
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
 #IF this is not setup correctly the entire model will fail, so it is important to get this right
@@ -13,195 +33,317 @@ from torch.utils.data import Dataset, DataLoader
 
 
 
-class MRNetDataset(Dataset):
+class MRNetDataset(torch.utils.data.Dataset):
     """
-    Dataset for MRNet knee MRI data.
+    Dataset for MRNet knee MRI data with single view approach.
     
-    This dataset handles cases where not all views (axial, coronal, sagittal) 
-    may be available for every case ID. The dataset returns only the views
-    that are available for each case.
+    This dataset handles loading of MRI data from a specific anatomical view:
+    - Axial (top-down view)
+    - Coronal (front-to-back view)
+    - Sagittal (side view)
+    
+    Each MRI consists of multiple 2D slices that together form a 3D volume.
     """
-    def __init__(self, root_dir, task, train=True, transform=None, require_all_views=False):
+    def __init__(self, root_dir, task, split='train', transform=None, max_slices=32, view=None):
         """
+        Initialize the dataset.
+        
         Args:
-            root_dir (str): Root directory of the project
-            task (str): 'acl', 'meniscus', or 'abnormal'
-            train (bool): If True, use training data, else validation
-            transform: Optional transforms to apply to images
-            require_all_views (bool): If True, only include cases with all three views
+            root_dir (str): Project root directory
+            task (str): Classification task ('abnormal', 'acl', or 'meniscus')
+            split (str): Dataset split ('train', 'valid', or 'test')
+            transform (callable, optional): Transform to apply to the data
+            max_slices (int): Maximum number of slices to use per MRI volume
+            view (str, optional): Specific view to load ('axial', 'coronal', 'sagittal').
+                                  If None, all views will be loaded, but this is less efficient.
         """
         self.root_dir = root_dir
         self.task = task
-        self.train = train
+        self.split = split
         self.transform = transform
+        self.max_slices = max_slices
         
-        # Set up paths
-        split = 'train' if train else 'valid'
+        # Determine which views to load
+        self.views_to_load = [view] if view else ['axial', 'coronal', 'sagittal']
         
-        # Set up the data directory path
-        self.data_dir = os.path.join(root_dir, 'data', 'MRNet-v1.0', f'processed_{split}_data')
+        # Load labels based on split
+        self.labels_path = self._get_labels_path()
+        self.labels = self._load_labels()
         
-        # Verify the directory exists
-        if not os.path.exists(self.data_dir):
-            raise FileNotFoundError(
-                f"Processed data directory not found at {self.data_dir}. "
-                "Please ensure you have run the data normalization script first."
-            )
-        print(f"Using processed data from: {self.data_dir}")
+        # Set up data directories
+        self.view_dirs = self._setup_data_directories()
         
-        # Load labels
-        labels_file = f"{split}-{task}.csv"
-        labels_path = os.path.join(root_dir, 'data', 'MRNet-v1.0', labels_file)
-        if not os.path.exists(labels_path):
-            raise FileNotFoundError(f"Labels file not found at {labels_path}")
+        # Log dataset information
+        self._log_dataset_info()
         
-        self.labels_df = pd.read_csv(labels_path, header=None)
-        
-        # Get case IDs
-        case_ids = self.labels_df.iloc[:, 0].values
-        labels = self.labels_df.iloc[:, 1].values
-            
-        # Discover available case files for each view
-        self.available_files = self._discover_available_files()
-        
-        if require_all_views:
-            valid_indices = []
-            for i, case_id in enumerate(case_ids):
-                if self._has_all_views(case_id):
-                    valid_indices.append(i)
-            
-            if valid_indices:
-                self.case_ids = case_ids[valid_indices]
-                self.labels = labels[valid_indices]
-                print(f"Filtered from {len(case_ids)} to {len(self.case_ids)} cases with all views")
-            else:
-                print("WARNING: No cases found with all views available. Using all cases.")
-                self.case_ids = case_ids
-                self.labels = labels
+    def _get_labels_path(self):
+        """Get the path to the labels file based on the dataset split."""
+        if self.split == 'train':
+            return os.path.join(self.root_dir, 'data', 'MRNet-v1.0', f'train-{self.task}-split_train.csv')
+        elif self.split == 'valid':
+            return os.path.join(self.root_dir, 'data', 'MRNet-v1.0', f'valid-{self.task}.csv')
+        elif self.split == 'test':
+            return os.path.join(self.root_dir, 'data', 'MRNet-v1.0', f'train-{self.task}-split_test.csv')
         else:
-            self.case_ids = case_ids
-            self.labels = labels
+            raise ValueError(f"Invalid split: {self.split}. Must be 'train', 'valid', or 'test'.")
     
-    def _discover_available_files(self):
-        """Discover what files are available for each view"""
-        available_files = {'axial': {}, 'coronal': {}, 'sagittal': {}}
+    def _load_labels(self):
+        """Load and validate the labels file."""
+        if not os.path.exists(self.labels_path):
+            raise FileNotFoundError(f"Labels file not found: {self.labels_path}")
         
-        for view in ['axial', 'coronal', 'sagittal']:
-            view_dir = os.path.join(self.data_dir, view)
-            if os.path.exists(view_dir):
-                # Get all .npy files in this view directory
-                file_pattern = os.path.join(view_dir, "*.npy")
-                files = glob.glob(file_pattern)
-                
-                for file_path in files:
-                    # Extract case ID from filename
-                    filename = os.path.basename(file_path)
-                    case_id = int(os.path.splitext(filename)[0])  # Remove .npy extension and convert to int
-                    available_files[view][case_id] = file_path
-                
-                print(f"Found {len(files)} {view} files in {view_dir}")
+        return pd.read_csv(self.labels_path, header=None, names=['case_id', 'label'])
+    
+    def _setup_data_directories(self):
+        """Set up the directories for each view based on the split."""
+        if self.split == 'train':
+            data_dir = os.path.join(self.root_dir, 'data', 'MRNet-v1.0', 'processed_train_data')
+            return {
+                'axial': os.path.join(data_dir, 'axial_train'),
+                'coronal': os.path.join(data_dir, 'coronal_train'),
+                'sagittal': os.path.join(data_dir, 'sagittal_train')
+            }
+        elif self.split == 'valid':
+            data_dir = os.path.join(self.root_dir, 'data', 'MRNet-v1.0', 'processed_valid_data')
+            return {
+                'axial': os.path.join(data_dir, 'axial'),
+                'coronal': os.path.join(data_dir, 'coronal'),
+                'sagittal': os.path.join(data_dir, 'sagittal')
+            }
+        elif self.split == 'test':
+            data_dir = os.path.join(self.root_dir, 'data', 'MRNet-v1.0', 'processed_train_data')
+            return {
+                'axial': os.path.join(data_dir, 'axial_test'),
+                'coronal': os.path.join(data_dir, 'coronal_test'),
+                'sagittal': os.path.join(data_dir, 'sagittal_test')
+            }
+    
+    def _log_dataset_info(self):
+        """Log information about the dataset."""
+        logger.info(f"Dataset initialized: task={self.task}, split={self.split}")
+        logger.info(f"Loading views: {self.views_to_load}")
+        logger.info(f"Max slices per MRI: {self.max_slices}")
+        
+        # Verify directories exist
+        for view in self.views_to_load:
+            dir_path = self.view_dirs[view]
+            if not os.path.exists(dir_path):
+                logger.warning(f"View directory not found: {dir_path}")
             else:
-                print(f"WARNING: {view} directory not found at {view_dir}")
+                file_count = len([f for f in os.listdir(dir_path) if f.endswith('.npy')])
+                logger.info(f"Found {file_count} .npy files in {view} directory")
         
-        return available_files
+        logger.info(f"Loaded {len(self.labels)} cases")
     
-    def _has_all_views(self, case_id):
-        """Check if all views are available for this case ID"""
-        case_id_int = int(case_id)
-        return (case_id_int in self.available_files['axial'] and 
-                case_id_int in self.available_files['coronal'] and 
-                case_id_int in self.available_files['sagittal'])
-        
     def __len__(self):
-        return len(self.case_ids)
+        """Return the number of cases in this dataset."""
+        return len(self.labels)
     
     def __getitem__(self, idx):
-        case_id = self.case_ids[idx]
-        label = self.labels[idx]
-        case_id_int = int(case_id)
+        """
+        Get a sample from the dataset.
         
-        # Initialize result dictionary with label and case_id
-        result = {
+        Args:
+            idx (int): Index of the sample to fetch
+            
+        Returns:
+            dict: Sample dictionary containing case ID, label, available views, and MRI data
+        """
+        # Get case info
+        case_id = self.labels.iloc[idx, 0]
+        case_path = f"{int(case_id):04d}.npy"  # Format to match file naming
+        label = self.labels.iloc[idx, 1]
+        
+        # Initialize sample dictionary
+        sample = {
+            'case_id': case_id, 
             'label': torch.tensor(label, dtype=torch.float32),
-            'case_id': case_id,
             'available_views': []
         }
         
-        # Try different formats for the case ID
-        for view in ['axial', 'coronal', 'sagittal']:
-            # First check if it's in our discovered files
-            if hasattr(self, 'available_files') and case_id_int in self.available_files[view]:
-                file_path = self.available_files[view][case_id_int]
+        # Load data for each requested view
+        for view in self.views_to_load:
+            file_path = os.path.join(self.view_dirs[view], case_path)
+            if os.path.exists(file_path):
                 try:
+                    # Load the data
                     data = np.load(file_path)
-                    tensor = torch.from_numpy(data)
+                    
+                    # Apply slice limiting if needed
+                    if data.shape[0] > self.max_slices:
+                        # Take center slices (most diagnostically relevant)
+                        start_idx = max(0, (data.shape[0] - self.max_slices) // 2)
+                        data = data[start_idx:start_idx + self.max_slices]
+                    
+                    # Apply transform if provided
                     if self.transform:
-                        tensor = self.transform(tensor)
-                    result[view] = tensor
-                    result['available_views'].append(view)
+                        data = self.transform(data)
+                    
+                    sample[view] = torch.tensor(data, dtype=torch.float32)
+                    sample['available_views'].append(view)
+                    
                 except Exception as e:
-                    print(f"Error loading {file_path}: {e}")
-            else:
-                # If not found in discovered files, try with zero-padding to 4 digits
-                formatted_case_id = f"{case_id_int:04d}"
-                path = os.path.join(self.data_dir, view, f"{formatted_case_id}.npy")
-                
-                if os.path.exists(path):
-                    try:
-                        data = np.load(path)
-                        tensor = torch.from_numpy(data)
-                        if self.transform:
-                            tensor = self.transform(tensor)
-                        result[view] = tensor
-                        result['available_views'].append(view)
-                    except Exception as e:
-                        print(f"Error loading {path}: {e}")
-        
-        # If no views are available, print a warning
-        if not result['available_views']:
-            # Less verbose warning to avoid spamming
-            if idx < 20:  # Only print for first 20 cases
-                print(f"Warning: No views available for case {case_id}")
-        
-        return result
-    #this is created in another file as well see if we need the duplicate function
-    def custom_collate(batch):
-        """
-        Custom collate function for DataLoader with variable slices.
-        Handles cases where different samples might have different views available.
-        
-        Args:
-            batch: List of samples from MRNetDataset
+                    logger.error(f"Error loading {view} for case {case_id}: {str(e)}")
             
-        Returns:
-            Dictionary containing:
-                - label: Stacked labels
-                - case_id: List of case IDs
-                - available_views: List of views available in the batch
-                - view tensors: Stacked tensors for each available view
-        """
-        # Find common views available in all samples
-        available_in_all = set(['axial', 'coronal', 'sagittal'])
-        for sample in batch:
-            available_in_sample = set(sample['available_views'])
-            available_in_all = available_in_all.intersection(available_in_sample)
+        # Check if we have any views available
+        if not sample['available_views']:
+            logger.warning(f"No views available for case {case_id} (idx={idx})")
+            
+        return sample
+
+
+def custom_collate(batch):
+    """
+    Custom collation function for single-view MRI data.
+    
+    This function handles variable-sized 3D MRI volumes by collating 
+    only the samples that have a particular view available.
+    
+    Args:
+        batch (list): List of sample dictionaries from the dataset
         
-        # Create batch with only common views and necessary data
-        result = {
-            'label': torch.stack([sample['label'] for sample in batch]),
-            'case_id': [sample['case_id'] for sample in batch],
-            'available_views': list(available_in_all)
-        }
+    Returns:
+        dict: Collated batch with stacked tensors for each available view
+    """
+    # Start with collecting simple values
+    collated_batch = {
+        'case_id': [item['case_id'] for item in batch],
+        'label': torch.stack([item['label'] for item in batch]),
+    }
+    
+    # Find all available views across the batch
+    all_views = set()
+    for item in batch:
+        all_views.update(item['available_views'])
+    
+    collated_batch['available_views'] = list(all_views)
+    
+    # Collate each view separately
+    for view in all_views:
+        # Get all tensors for this view
+        view_tensors = []
+        for item in batch:
+            if view in item['available_views']:
+                view_tensors.append(item[view])
         
-        # Add tensors for available views (even if not common to all)
-        all_available_views = set()
-        for sample in batch:
-            all_available_views.update(sample['available_views'])
+        if view_tensors:
+            try:
+                # Stack them along the batch dimension
+                collated_batch[view] = torch.stack(view_tensors)
+            except Exception as e:
+                logger.error(f"Error stacking {view} tensors: {str(e)}")
+                # Log individual tensor shapes for debugging
+                logger.debug("Individual tensor shapes:")
+                for i, tensor in enumerate(view_tensors):
+                    logger.debug(f"  Tensor {i}: {tensor.shape}, dtype={tensor.dtype}")
+    
+    return collated_batch
+
+
+def get_mrnet_dataloader(root_dir, task, view, split='train', transform=None, 
+                        batch_size=4, num_workers=1, shuffle=True, max_slices=32):
+    """
+    Create a DataLoader for single-view MRNet data.
+    
+    This is a convenience function that sets up both the dataset and dataloader
+    with the proper configuration for the single-view approach.
+    
+    Args:
+        root_dir (str): Project root directory
+        task (str): Classification task ('abnormal', 'acl', or 'meniscus')
+        view (str): The specific view to load ('axial', 'coronal', or 'sagittal')
+        split (str): Dataset split ('train', 'valid', or 'test')
+        transform (callable, optional): Transform to apply to the data
+        batch_size (int): Batch size
+        num_workers (int): Number of worker processes for loading data
+        shuffle (bool): Whether to shuffle the data
+        max_slices (int): Maximum number of slices to use per MRI volume
         
-        for view in all_available_views:
-            # Get samples that have this view
-            valid_samples = [sample[view] for sample in batch if view in sample['available_views']]
-            if valid_samples:
-                result[view] = torch.stack(valid_samples)
+    Returns:
+        torch.utils.data.DataLoader: DataLoader for MRNet data
+    """
+    from torch.utils.data import DataLoader
+    
+    dataset = MRNetDataset(
+        root_dir=root_dir,
+        task=task,
+        split=split,
+        transform=transform,
+        max_slices=max_slices,
+        view=view  # Explicitly pass the view for single-view approach
+    )
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=custom_collate,
+        pin_memory=True
+    )
+
+def create_data_split(root_dir, task, test_size=0.2, random_state=42):
+    """
+    Create train/test split from the training data.
+    
+    Args:
+        root_dir (str): Root directory containing the data
+        task (str): 'acl', 'meniscus', or 'abnormal'
+        test_size (float): Proportion of data to use for testing
+        random_state (int): Random seed for reproducibility
+    
+    Returns:
+        dict: Contains train and test case IDs and labels
+    """
+    # Construct the labels path using your existing structure
+    labels_path = os.path.join(root_dir, 'data', 'MRNet-v1.0', f'train-{task}.csv')
+    
+    # Verify file exists
+    if not os.path.exists(labels_path):
+        raise FileNotFoundError(f"Labels file not found at {labels_path}")
+    
+    # Load and verify CSV structure
+    try:
+        df = pd.read_csv(labels_path)
+        # Check if headers exist by looking at column names
+        if df.columns.tolist() == ['case_id', 'label']:
+            # CSV already has correct headers
+            pass
+        else:
+            # Assume no headers, assign them
+            df = pd.read_csv(labels_path, names=['case_id', 'label'])
         
-        return result
+        # Verify data types
+        df['label'] = df['label'].astype(float)
+        df['case_id'] = df['case_id'].astype(str)
+        
+    except Exception as e:
+        raise ValueError(f"Error reading labels file: {e}")
+    
+    # Verify we have enough data for splitting
+    if len(df) < 10:  # arbitrary minimum size
+        raise ValueError(f"Dataset too small to split: {len(df)} samples")
+    
+    # Verify we have both classes for stratification
+    if len(df['label'].unique()) < 2:
+        print("Warning: Only one class found in dataset, stratification disabled")
+        stratify = None
+    else:
+        stratify = df['label'].values
+    
+    # Create the split
+    train_cases, test_cases, train_labels, test_labels = train_test_split(
+        df['case_id'].values,
+        df['label'].values,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=stratify
+    )
+    
+    # Verify split sizes
+    print(f"Split sizes - Train: {len(train_cases)}, Test: {len(test_cases)}")
+    
+    return {
+        'train': {'case_ids': train_cases, 'labels': train_labels},
+        'test': {'case_ids': test_cases, 'labels': test_labels}
+    }

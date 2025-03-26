@@ -1,49 +1,76 @@
+"""
+MRNet Model Implementation
+
+This module provides the neural network model architecture used in the MRNet project
+for knee MRI abnormality detection. It implements both:
+- A single-view model (MRNetModel) that processes MRI data from one anatomical view
+- An ensemble model (MRNetEnsemble) that can combine predictions from multiple views
+
+The architecture is based on the approach described in the Stanford ML Group's MRNet paper:
+https://stanfordmlgroup.github.io/projects/mrnet/
+"""
+
 import torch
 import torch.nn as nn
 import torchvision.models as models
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 
 class MRNetModel(nn.Module):
     """
-    MRNet model architecture as described in the paper:
-    https://stanfordmlgroup.github.io/projects/mrnet/
+    MRNet model architecture for single-view MRI classification.
     
-    Uses a pretrained AlexNet backbone with a custom classifier.
+    Uses a pretrained CNN backbone (default: AlexNet) to extract features from each MRI slice,
+    then applies max pooling across slices to get the most important features from the volume.
+    Finally, a classifier MLP makes the final abnormality prediction.
     """
+    
     def __init__(self, backbone='alexnet'):
+        """
+        Initialize the MRNet model.
+        
+        Args:
+            backbone (str): The pretrained model to use as feature extractor.
+                            Options: 'alexnet', 'resnet18', 'densenet121'
+        """
         super(MRNetModel, self).__init__()
         
-        #Choosing pretrained base models here for image classification make sure these decisions are optimal -Cam
+        # Set up the feature extractor backbone
         if backbone == 'alexnet':
             self.backbone = models.alexnet(pretrained=True)
             feature_dim = 256 * 6 * 6  # AlexNet's output dimension
+            self.feature_extractor = self.backbone.features
         elif backbone == 'resnet18':
             self.backbone = models.resnet18(pretrained=True)
             feature_dim = 512  # ResNet18's output dimension
+            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
+        elif backbone == 'densenet121':
+            self.backbone = models.densenet121(pretrained=True)
+            feature_dim = self.backbone.classifier.in_features  # DenseNet specific
+            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
-        
-
-        #There could be improvments make the feature extractor will investigate - Cam
-        if backbone == 'alexnet':
-            self.feature_extractor = self.backbone.features
-        else:  # For ResNet, keep everything except the final FC layer
-            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
         
         # Global average pooling for variable slice count
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         
-        # This is building the Multi-Layer Perceptron (MLP) classifier
-        #I feel like there are improvments/options for this piece below it is very important
+        # MLP classifier that takes feature vectors and outputs abnormality prediction
         self.classifier = nn.Sequential(
             nn.Linear(feature_dim, 1024),
-            nn.ReLU(), #RELU activation function
+            nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(1024, 1)
         )
         
+        logger.info(f"Initialized MRNetModel with {backbone} backbone")
+        
     def forward(self, x):
         """
-        Forward pass through the model
+        Forward pass through the model.
         
         Args:
             x: Input tensor of shape [batch_size, num_slices, channels, height, width]
@@ -52,8 +79,7 @@ class MRNetModel(nn.Module):
         Returns:
             Tensor of shape [batch_size, 1] with the abnormality prediction
         """
-
-        #Setting the tensor shape which will allow us to process all slices as a batch below
+        # Extract dimensions from input
         batch_size, num_slices, channels, height, width = x.shape
         
         # Reshape to process all slices as a batch
@@ -62,46 +88,57 @@ class MRNetModel(nn.Module):
         # Extract features from all slices
         features = self.feature_extractor(x)
         
-        # Reshape back to separate batches and slices
+        # Reshape back to separate batches and slices, based on backbone architecture
         if isinstance(self.backbone, models.AlexNet):
-            # For AlexNet
             features = features.view(batch_size, num_slices, 256, 6, 6)
-        else:
-            # For ResNet
+        elif isinstance(self.backbone, models.DenseNet):
+            features = features.view(batch_size, num_slices, self.backbone.classifier.in_features, 1, 1)
+        else:  # For ResNet
             features = features.view(batch_size, num_slices, 512, 1, 1)
         
-        # Global max pooling across slices
-        #This is a way to reduce the dimensionality of the features and keep the most important information, INVESTIGATE - Cam
+        # Apply max pooling across slices to get the most important features
+        # This effectively reduces the volume to a single "representative" slice
         features = torch.max(features, dim=1)[0]
         
-        # Flatten the features
+        # Flatten the features for the classifier
         features = features.view(batch_size, -1)
         
-        # Classification head
+        # Apply the classifier to get final prediction
         output = self.classifier(features)
         
         return output
 
-##Ensemble Method is not working
+
 class MRNetEnsemble(nn.Module):
     """
-    MRNet ensemble model that combines predictions from three separate models,
-    one for each view (axial, coronal, sagittal).
+    MRNet ensemble model that combines predictions from separate models
+    for each anatomical view (axial, coronal, sagittal).
+    
+    Note: This functionality is not currently working in the pipeline.
     """
+    
     def __init__(self, backbone='alexnet'):
+        """
+        Initialize the ensemble model.
+        
+        Args:
+            backbone (str): The pretrained model to use for each view's model
+        """
         super(MRNetEnsemble, self).__init__()
         
-        # Create a separate model for each view
+        # Create a separate model for each anatomical view
         self.axial_model = MRNetModel(backbone)
         self.coronal_model = MRNetModel(backbone)
         self.sagittal_model = MRNetModel(backbone)
         
-        # Logistic regression to combine the three models
+        # Logistic regression to combine the three model predictions
         self.combiner = nn.Linear(3, 1)
+        
+        logger.info(f"Initialized MRNetEnsemble with {backbone} backbone")
         
     def forward(self, data_dict):
         """
-        Forward pass through the ensemble model
+        Forward pass through the ensemble model.
         
         Args:
             data_dict: Dictionary containing tensors for each view
@@ -114,6 +151,7 @@ class MRNetEnsemble(nn.Module):
         """
         outputs = []
         
+        # Process each available view
         if 'axial' in data_dict:
             axial_output = self.axial_model(data_dict['axial'])
             outputs.append(axial_output)
