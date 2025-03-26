@@ -47,7 +47,6 @@ class MRNetModel(nn.Module):
         elif backbone == 'resnet18':
             self.backbone = models.resnet18(pretrained=True)
             feature_dim = 512  # ResNet18's output dimension
-<<<<<<< HEAD
             self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
         elif backbone == 'densenet121':
             self.backbone = models.densenet121(pretrained=True)
@@ -56,23 +55,6 @@ class MRNetModel(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
         
-=======
-        elif backbone == 'densenet121':
-            self.backbone = models.densenet121(pretrained=True)
-            feature_dim = self.backbone.classifier.in_features  # DenseNet specific
-        else:
-            raise ValueError(f"Unsupported backbone: {backbone}")
-        
-
-        #There could be improvments make the feature extractor will investigate - Cam
-        if backbone == 'alexnet':
-            self.feature_extractor = self.backbone.features
-        elif backbone == 'densenet121':
-            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
-        else:  # For ResNet
-            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
-        
->>>>>>> e1c80908228f173060b9a8f591340f1f5bd63a3f
         # Global average pooling for variable slice count
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         

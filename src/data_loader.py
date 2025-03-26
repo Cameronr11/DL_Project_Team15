@@ -17,7 +17,6 @@ import os
 import glob
 from torch.utils.data import Dataset, DataLoader
 from src.data_augmentation import SimpleMRIAugmentation
-<<<<<<< HEAD
 from sklearn.model_selection import train_test_split
 import json
 import logging
@@ -25,8 +24,6 @@ import logging
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-=======
->>>>>>> e1c80908228f173060b9a8f591340f1f5bd63a3f
 
 
 #IF this is not setup correctly the entire model will fail, so it is important to get this right
@@ -62,19 +59,9 @@ class MRNetDataset(torch.utils.data.Dataset):
         """
         self.root_dir = root_dir
         self.task = task
-<<<<<<< HEAD
         self.split = split
         self.transform = transform
         self.max_slices = max_slices
-=======
-        self.train = train
-        
-        # Add simple augmentation only for training
-        if train:
-            self.transform = SimpleMRIAugmentation(p=0.5)
-        else:
-            self.transform = None
->>>>>>> e1c80908228f173060b9a8f591340f1f5bd63a3f
         
         # Determine which views to load
         self.views_to_load = [view] if view else ['axial', 'coronal', 'sagittal']
@@ -181,7 +168,6 @@ class MRNetDataset(torch.utils.data.Dataset):
                 try:
                     # Load the data
                     data = np.load(file_path)
-<<<<<<< HEAD
                     
                     # Apply slice limiting if needed
                     if data.shape[0] > self.max_slices:
@@ -198,48 +184,6 @@ class MRNetDataset(torch.utils.data.Dataset):
                     
                 except Exception as e:
                     logger.error(f"Error loading {view} for case {case_id}: {str(e)}")
-=======
-                    tensor = torch.from_numpy(data)
-                    # Apply augmentation only during training
-                    if self.train and self.transform:
-                        tensor = self.transform(tensor)
-                    result[view] = tensor
-                    result['available_views'].append(view)
-                except Exception as e:
-                    print(f"Error loading {file_path}: {e}")
-            else:
-                # If not found in discovered files, try with zero-padding to 4 digits
-                formatted_case_id = f"{case_id_int:04d}"
-                path = os.path.join(self.data_dir, view, f"{formatted_case_id}.npy")
-                
-                if os.path.exists(path):
-                    try:
-                        data = np.load(path)
-                        tensor = torch.from_numpy(data)
-                        # Apply augmentation only during training
-                        if self.train and self.transform:
-                            tensor = self.transform(tensor)
-                        result[view] = tensor
-                        result['available_views'].append(view)
-                    except Exception as e:
-                        print(f"Error loading {path}: {e}")
-        
-        # If no views are available, print a warning
-        if not result['available_views']:
-            # Less verbose warning to avoid spamming
-            if idx < 20:  # Only print for first 20 cases
-                print(f"Warning: No views available for case {case_id}")
-        
-        return result
-    #this is created in another file as well see if we need the duplicate function
-    def custom_collate(batch):
-        """
-        Custom collate function for DataLoader with variable slices.
-        Handles cases where different samples might have different views available.
-        
-        Args:
-            batch: List of samples from MRNetDataset
->>>>>>> e1c80908228f173060b9a8f591340f1f5bd63a3f
             
         # Check if we have any views available
         if not sample['available_views']:

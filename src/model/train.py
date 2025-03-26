@@ -529,11 +529,7 @@ if __name__ == "__main__":
     # Model parameters
     parser.add_argument('--backbone', type=str, default='alexnet',
                         choices=['alexnet', 'resnet18', 'densenet121'],
-<<<<<<< HEAD
                         help='Neural network backbone to use')
-=======
-                        help='Backbone architecture')
->>>>>>> e1c80908228f173060b9a8f591340f1f5bd63a3f
     parser.add_argument('--train_approach', type=str, default='per_view',
                         choices=['per_view', 'ensemble'],
                         help='Training approach')
