@@ -590,7 +590,7 @@ def main():
     
     # Model parameters
     parser.add_argument('--backbone', type=str, default='resnet18',
-                        choices=['alexnet', 'resnet18', 'densenet121'],
+                        choices=['alexnet', 'resnet18', 'resnet34', 'densenet121'],
                         help='Backbone architecture')
     parser.add_argument('--train_approach', type=str, default='per_view',
                         choices=['per_view'],  # Only per_view is available now

@@ -35,7 +35,7 @@ class MRNetModel(nn.Module):
         
         Args:
             backbone (str): The pretrained model to use as feature extractor.
-                            Options: 'alexnet', 'resnet18', 'densenet121'
+                            Options: 'alexnet', 'resnet18', 'resnet34', 'densenet121'
         """
         super(MRNetModel, self).__init__()
         
@@ -47,6 +47,10 @@ class MRNetModel(nn.Module):
         elif backbone == 'resnet18':
             self.backbone = models.resnet18(pretrained=True)
             feature_dim = 512  # ResNet18's output dimension
+            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
+        elif backbone == 'resnet34':
+            self.backbone = models.resnet34(pretrained=True)
+            feature_dim = 512  # ResNet34's output dimension (same as ResNet18)
             self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
         elif backbone == 'densenet121':
             self.backbone = models.densenet121(pretrained=True)
