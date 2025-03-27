@@ -157,8 +157,16 @@ def train_model_ddp(rank, world_size, args):
         # Determine which view to load if using per_view approach
         view_to_load = args.view
         
-        # Determine max slices based on whether we're loading a single view
-        max_slices = 64  # Use more slices if loading a single view
+        # Determine max slices based on backbone model
+        if args.max_slices is not None:
+            max_slices = args.max_slices  # Use user-specified value
+        elif args.backbone == 'densenet121':
+            max_slices = 32  # Use fewer slices for DenseNet121
+        else:  # resnet18 or others
+            max_slices = 64  # Use more slices for other backbones
+            
+        if is_master:
+            print(f"[Process {rank}] Using {max_slices} max slices for {args.backbone}")
         
         # Create datasets with updated parameters
         train_dataset = MRNetDataset(
@@ -619,6 +627,10 @@ def main():
                         help='Number of GPUs to use (default: all available minus one)')
     parser.add_argument('--use_all_gpus', action='store_true',
                         help='Use all available GPUs instead of reserving one')
+    
+    # Add a new argument to control max slices
+    parser.add_argument('--max_slices', type=int, default=None,
+                        help='Maximum number of slices to use for training')
     
     args = parser.parse_args()
     
