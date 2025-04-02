@@ -10,6 +10,9 @@ from src.model.MRNetModel import MRNetModel
 import json
 import argparse
 from src.model.train_multi_gpu import get_project_root
+from src.utils.metric_tracker import MetricTracker
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 def test_model(args, model, device, test_loader, criterion):
     """
@@ -71,7 +74,21 @@ def test_model(args, model, device, test_loader, criterion):
     print("\nClassification Report:")
     print(classification_report(test_true, test_pred_binary))
     
-    return test_auc, test_loss / len(test_loader)
+    # Calculate additional metrics for reporting
+    metrics = {
+        "test_loss": test_loss / len(test_loader),
+        "test_auc": test_auc,
+        "test_samples": total_samples
+    }
+    
+    # Add classification report metrics
+    report = classification_report(test_true, test_pred_binary, output_dict=True)
+    for class_label, class_metrics in report.items():
+        if isinstance(class_metrics, dict):
+            for metric_name, metric_value in class_metrics.items():
+                metrics[f"test_{class_label}_{metric_name}"] = metric_value
+    
+    return test_auc, test_loss / len(test_loader), test_true, test_pred, test_pred_binary, metrics
 
 def selective_collate(batch, view=None):
     """
@@ -142,7 +159,20 @@ def main():
                       help='Maximum number of slices to use per MRI (should match training)')
     parser.add_argument('--num_workers', type=int, default=1,
                       help='Number of worker processes for data loading')
+    parser.add_argument('--output_dir', type=str, default=None,
+                      help='Directory to save test results and plots')
+    parser.add_argument('--generate_plots', action='store_true',
+                      help='Generate visualizations for test results')
     args = parser.parse_args()
+    
+    # Setup output directory
+    if args.output_dir is None:
+        # Create default output directory based on model info
+        model_name = os.path.basename(args.model_path).replace('.pth', '')
+        args.output_dir = os.path.join('results', f"{model_name}_test_results")
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
     
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -154,8 +184,14 @@ def main():
     print(f"Backbone: {args.backbone}")
     print(f"Max slices: {args.max_slices}")
     print(f"Model path: {args.model_path}")
+    print(f"Output directory: {args.output_dir}")
     print(f"Device: {device}")
     print("=========================\n")
+    
+    # Save test configuration
+    config_path = os.path.join(args.output_dir, 'test_config.json')
+    with open(config_path, 'w') as f:
+        json.dump(vars(args), f, indent=4)
     
     # Load test dataset
     test_dataset = MRNetDataset(
@@ -198,31 +234,120 @@ def main():
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
-    # Loss function
+    # Create loss function
     criterion = nn.BCEWithLogitsLoss()
     
-    # Run testing
-    test_auc, test_loss = test_model(args, model, device, test_loader, criterion)
+    # Initialize metric tracker for test results
+    model_name = os.path.basename(args.model_path).replace('.pth', '')
+    metric_tracker = MetricTracker(
+        model_name=model_name,
+        task=args.task,
+        view=args.view,
+        config=vars(args),
+        output_dir=args.output_dir
+    )
     
-    # Save results
-    results_dir = os.path.join(get_project_root(), 'results')
-    os.makedirs(results_dir, exist_ok=True)
+    # Evaluate model
+    test_auc, test_loss, test_true, test_pred, test_pred_binary, metrics = test_model(
+        args, model, device, test_loader, criterion
+    )
     
-    results = {
-        'task': args.task,
-        'view': args.view,
-        'backbone': args.backbone,
-        'train_approach': args.train_approach,
-        'test_auc': float(test_auc),  # Convert to float for JSON serialization
-        'test_loss': float(test_loss)
-    }
+    # Update and save metrics
+    metric_tracker.update_test(metrics)
+    metric_tracker.save_metrics()
     
-    results_path = os.path.join(results_dir, 
-                               f'test_results_{args.task}_{args.view}_{args.backbone}.json')
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=4)
+    # Save predictions for later analysis
+    np.save(os.path.join(args.output_dir, 'test_true.npy'), np.array(test_true))
+    np.save(os.path.join(args.output_dir, 'test_scores.npy'), np.array(test_pred))
+    np.save(os.path.join(args.output_dir, 'test_pred_binary.npy'), np.array(test_pred_binary))
     
-    print(f"\nResults saved to {results_path}")
+    # Generate comprehensive model summary
+    summary = metric_tracker.generate_summary(
+        y_true=test_true, 
+        y_score=test_pred, 
+        y_pred=test_pred_binary
+    )
+    
+    # Generate visualizations if requested
+    if args.generate_plots:
+        print("\nGenerating test result visualizations...")
+        
+        # Confusion matrix
+        plot_confusion_matrix(test_true, test_pred_binary)
+        plt_path = os.path.join(args.output_dir, 'confusion_matrix.png')
+        plt.savefig(plt_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # ROC curve
+        plot_roc_curve(test_true, test_pred)
+        plt_path = os.path.join(args.output_dir, 'roc_curve.png')
+        plt.savefig(plt_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Precision-Recall curve
+        plot_precision_recall_curve(test_true, test_pred)
+        plt_path = os.path.join(args.output_dir, 'precision_recall_curve.png')
+        plt.savefig(plt_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Visualizations saved to {args.output_dir}")
+    
+    print("\nTest evaluation completed!")
+    print(f"Final Test AUC: {test_auc:.4f}")
+    print(f"Final Test Loss: {test_loss:.4f}")
+    print(f"Results saved to: {args.output_dir}")
 
-if __name__ == '__main__':
+# We'll create our own plotting functions instead of importing non-existent ones
+def plot_confusion_matrix(y_true, y_pred, save_path=None):
+    """Plot confusion matrix."""
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    return plt.gcf()
+
+def plot_roc_curve(y_true, y_score, save_path=None):
+    """Plot ROC curve."""
+    from sklearn.metrics import roc_curve
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    roc_auc = np.trapz(tpr, fpr)  # Area under ROC curve
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, label=f'ROC curve (AUC = {roc_auc:.3f})')
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve')
+    plt.legend(loc='lower right')
+    plt.grid(True)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    return plt.gcf()
+
+def plot_precision_recall_curve(y_true, y_score, save_path=None):
+    """Plot precision-recall curve."""
+    from sklearn.metrics import precision_recall_curve
+    precision, recall, _ = precision_recall_curve(y_true, y_score)
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(recall, precision)
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve')
+    plt.grid(True)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    return plt.gcf()
+
+if __name__ == "__main__":
     main()
