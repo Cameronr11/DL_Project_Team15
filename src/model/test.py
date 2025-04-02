@@ -150,7 +150,7 @@ def main():
                       help='Path to saved model')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--backbone', type=str, default='resnet18',
-                      choices=['alexnet', 'resnet18', 'densenet121'],
+                      choices=['alexnet', 'resnet18', 'resnet34', 'densenet121'],
                       help='Backbone architecture')
     parser.add_argument('--train_approach', type=str, default='per_view',
                       choices=['per_view', 'ensemble'],

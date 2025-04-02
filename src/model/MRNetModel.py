@@ -35,7 +35,7 @@ class MRNetModel(nn.Module):
         
         Args:
             backbone (str): The pretrained model to use as feature extractor.
-                            Options: 'alexnet', 'resnet18', 'densenet121'
+                            Options: 'alexnet', 'resnet18', 'resnet34', 'densenet121'
         """
         super(MRNetModel, self).__init__()
         
@@ -47,6 +47,10 @@ class MRNetModel(nn.Module):
         elif backbone == 'resnet18':
             self.backbone = models.resnet18(pretrained=True)
             feature_dim = 512  # ResNet18's output dimension
+            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
+        elif backbone == 'resnet34':
+            self.backbone = models.resnet34(pretrained=True)
+            feature_dim = 512  # ResNet34's output dimension (same as ResNet18)
             self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
         elif backbone == 'densenet121':
             self.backbone = models.densenet121(pretrained=True)
@@ -88,20 +92,34 @@ class MRNetModel(nn.Module):
         # Extract features from all slices
         features = self.feature_extractor(x)
         
-        # Reshape back to separate batches and slices, based on backbone architecture
+        # Get the shape of the feature tensor for proper reshaping
+        feature_shape = features.shape
+        
+        # Get the total elements per slice to avoid shape mismatches
+        elements_per_slice = features.size(1) * features.size(2) * features.size(3) if len(feature_shape) > 3 else features.size(1)
+        total_elements = features.numel()
+        elements_per_batch = total_elements // batch_size
+        
+        # Reshape back to separate batches and slices dynamically based on feature dimensions
         if isinstance(self.backbone, models.AlexNet):
+            # For AlexNet, features shape is [batch*slices, 256, 6, 6]
             features = features.view(batch_size, num_slices, 256, 6, 6)
         elif isinstance(self.backbone, models.DenseNet):
-            features = features.view(batch_size, num_slices, self.backbone.classifier.in_features, 1, 1)
+            # For DenseNet, the features need to be flattened first due to its structure
+            features = self.global_pool(features)  # Apply global pooling to get [batch*slices, features, 1, 1]
+            features = features.view(batch_size, num_slices, -1)  # Reshape to [batch, slices, features]
         else:  # For ResNet
+            # For ResNet, features shape is [batch*slices, 512, 1, 1]
             features = features.view(batch_size, num_slices, 512, 1, 1)
         
         # Apply max pooling across slices to get the most important features
-        # This effectively reduces the volume to a single "representative" slice
-        features = torch.max(features, dim=1)[0]
-        
-        # Flatten the features for the classifier
-        features = features.view(batch_size, -1)
+        if isinstance(self.backbone, models.DenseNet):
+            # Already flattened, just max pool across slices
+            features = torch.max(features, dim=1)[0]
+        else:
+            # For other models, max pool then flatten
+            features = torch.max(features, dim=1)[0]
+            features = features.view(batch_size, -1)
         
         # Apply the classifier to get final prediction
         output = self.classifier(features)
