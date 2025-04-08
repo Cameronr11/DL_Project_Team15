@@ -26,6 +26,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+#this is a very simple augmentation that we can use to augment the data
+#however performance increase could be achieved by evaluating this and possibly adding more augmentations
+
+
 class SimpleMRIAugmentation:
     """
     Applies simple, safe augmentations for MRI data that preserve diagnostic information.
