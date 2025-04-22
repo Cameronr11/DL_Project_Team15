@@ -1,10 +1,6 @@
 import os
 import sys
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 import argparse
 import numpy as np
@@ -23,10 +19,77 @@ from src.data_loader import MRNetDataset, SimpleMRIAugmentation
 from src.model.MRNetModel import MRNetModel
 from src.utils.metric_tracker import MetricTracker
 
+# Add EarlyStopping class
+class EarlyStopping:
+    """
+    Early stopping to stop training when validation performance doesn't improve for a specified
+    number of consecutive epochs (patience).
+    
+    Args:
+        patience (int): How many epochs to wait after last improvement
+        verbose (bool): If True, prints a message for each validation improvement
+        delta (float): Minimum change to qualify as an improvement
+        mode (str): 'min' for loss, 'max' for metrics like AUC
+    """
+    def __init__(self, patience=7, verbose=True, delta=0, mode='max'):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.delta = delta
+        self.mode = mode
+        if mode == 'min':
+            self.val_score_min = float('inf')
+        else:  # mode == 'max'
+            self.val_score_min = float('-inf')
+        
+    def __call__(self, val_score, model=None, path=None):
+        score = val_score
+        
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_score, model, path)
+        else:
+            if self.mode == 'min':
+                improve_condition = score < self.best_score - self.delta
+            else:  # mode == 'max'
+                improve_condition = score > self.best_score + self.delta
+                
+            if improve_condition:
+                self.best_score = score
+                self.save_checkpoint(val_score, model, path)
+                self.counter = 0
+            else:
+                self.counter += 1
+                if self.verbose:
+                    print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+                if self.counter >= self.patience:
+                    self.early_stop = True
+        
+        return self.early_stop
+    
+    def save_checkpoint(self, val_score, model=None, path=None):
+        '''Save model when validation metric improves.'''
+        if self.verbose:
+            metric_name = "loss" if self.mode == 'min' else "metric"
+            print(f'Validation {metric_name} improved ({self.val_score_min:.6f} --> {val_score:.6f})')
+            
+        if self.mode == 'min':
+            self.val_score_min = val_score
+        else:  # mode == 'max'
+            self.val_score_min = val_score
+            
+        if model is not None and path is not None:
+            # Save model state dict (modified to handle non-DDP models)
+            if hasattr(model, 'module'):
+                torch.save(model.module.state_dict(), path)
+            else:
+                torch.save(model.state_dict(), path)
+
 def get_project_root():
     """Returns the absolute path to the project root directory"""
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 
 
 #checks gpu availability
@@ -40,172 +103,92 @@ def verify_gpu():
         print(f"Number of GPUs: {torch.cuda.device_count()}")
         for i in range(torch.cuda.device_count()):
             print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-            print(f"Memory: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.2f} GB")
     else:
-        print("WARNING: CUDA is not available. Multi-GPU training cannot proceed.")
+        print("WARNING: CUDA is not available. GPU training cannot proceed.")
     print("=====================\n")
 
 
-
-#allows us to track gpu memory usage
-def print_gpu_memory_stats(rank, location):
-    """
-    Print GPU memory usage at a specific location in the code
-    
-    Args:
-        rank (int): The process rank (GPU ID)
-        location (str): Description of where in the code this function is called
-    """
-    if rank == 0:  # Only print from master process
-        torch.cuda.synchronize()
-        gc.collect()
-        memory_allocated = torch.cuda.memory_allocated(rank) / (1024 ** 3)
-        memory_reserved = torch.cuda.memory_reserved(rank) / (1024 ** 3)
-        max_memory_allocated = torch.cuda.max_memory_allocated(rank) / (1024 ** 3)
-        
-        print(f"\n=== GPU Memory Stats at {location} ===")
-        print(f"GPU {rank} - Currently allocated: {memory_allocated:.2f} GB")
-        print(f"GPU {rank} - Currently reserved: {memory_reserved:.2f} GB")
-        print(f"GPU {rank} - Max allocated: {max_memory_allocated:.2f} GB")
-        print("===================================\n")
-
-
-
-
-#This is for the distributed training on GPU's currently we can only train on one GPU at a time
-def setup_ddp(rank, world_size, args):
-    """
-    Setup for Distributed Data Parallel
-    
-    Args:
-        rank (int): Unique ID for each process
-        world_size (int): Total number of processes
-        args (argparse.Namespace): Command line arguments
-    """
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = args.master_port
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-    if rank == 0:
-        print(f"Process {rank}: DDP setup complete, using device cuda:{rank}")
-
-
-
-#cleans up the distributed processes
-def cleanup_ddp():
-    """
-    Cleanup distributed processes
-    """
-    dist.destroy_process_group()
-
-
-
 #main training function
-def train_model_ddp(rank, world_size, args):
+def train_model(args):
     """
-    Training function for distributed training
+    Training function for single GPU training
     
     Args:
-        rank (int): Process rank
-        world_size (int): Total number of processes
         args (argparse.Namespace): Command line arguments
+    
+    Returns:
+        float: Best validation AUC achieved during training
     """
-    # Setup DDP
     try:
-        setup_ddp(rank, world_size, args)
-        device = torch.device(f'cuda:{rank}')
+        # Set up device
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA is not available. GPU training cannot proceed.")
         
-
-
+        device = torch.device('cuda:0')
+        torch.cuda.set_device(0)
+        
         # Enable mixed precision training to reduce memory usage
-        #this needs to be checked I don't know if this is correct but it does affect the efficiency of the model
         use_amp = True
         scaler = GradScaler() if use_amp else None
         
-        # Only print from master process
-        is_master = rank == 0
+        # Initialize TensorBoard writer
+        log_dir = os.path.join(args.output_dir, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f"TensorBoard logs will be saved to {log_dir}")
         
-
-
-
-        # Initialize TensorBoard writer (only on master process) There are alternatives to tensorboard that we need to evaluate
-        writer = None
-        if is_master:
-            log_dir = os.path.join(args.output_dir, 'logs')
-            os.makedirs(log_dir, exist_ok=True)
-            writer = SummaryWriter(log_dir=log_dir)
-            print(f"[Process {rank}] TensorBoard logs will be saved to {log_dir}")
+        # Initialize MetricTracker
+        model_name = f"{args.backbone}_{args.task}_{args.view}"
+        config = vars(args)  # Convert args to dictionary
+        metric_tracker = MetricTracker(
+            model_name=model_name,
+            task=args.task,
+            view=args.view,
+            config=config,
+            output_dir=args.output_dir
+        )
+        print(f"Metrics will be tracked and saved to {args.output_dir}")
         
-
-
-
-        # Initialize MetricTracker that we created to track the metrics of the model
-        metric_tracker = None
-        if is_master:
-            model_name = f"{args.backbone}_{args.task}_{args.view}"
-            config = vars(args)  # Convert args to dictionary
-            metric_tracker = MetricTracker(
-                model_name=model_name,
-                task=args.task,
-                view=args.view,
-                config=config,
-                output_dir=args.output_dir
+        # Initialize early stopping
+        early_stopping = None
+        if args.early_stopping:
+            early_stopping = EarlyStopping(
+                patience=args.early_stopping_patience, 
+                verbose=True, 
+                delta=args.early_stopping_delta,
+                mode='max'  # Using 'max' for AUC metric
             )
-            print(f"[Process {rank}] Metrics will be tracked and saved to {args.output_dir}")
+            print(f"Early stopping enabled with patience={args.early_stopping_patience}, delta={args.early_stopping_delta}")
+
+        # Print initial training process
+        print(f"\n=== Training Process Initialization ===")
+        print(f"Starting training on GPU")
+        print(f"Using mixed precision training: {use_amp}")
+        print(f"Running with PyTorch version: {torch.__version__}")
+        verify_gpu()
         
-
-        #this is for printing the initial training process and printed the intial gpu memory stats
-        if is_master:
-            print(f"\n=== Training Process Initialization ===")
-            print(f"Process {rank}: Starting training on {world_size} GPUs")
-            print(f"Using mixed precision training: {use_amp}")
-            print(f"Running with PyTorch version: {torch.__version__}")
-            verify_gpu()
-            
-            # Print CUDA memory at start
-            print("\n=== Initial GPU Memory Stats ===")
-            for i in range(torch.cuda.device_count()):
-                free_mem, total_mem = torch.cuda.mem_get_info(i)
-                free_mem_gb = free_mem / (1024**3)
-                total_mem_gb = total_mem / (1024**3)
-                print(f"GPU {i}: Free Memory: {free_mem_gb:.2f} GB / Total: {total_mem_gb:.2f} GB")
-            
-            print_gpu_memory_stats(rank, "after init")
-        
-
-
-
         # Get project root and create output directory
         project_root = get_project_root()
         os.makedirs(args.output_dir, exist_ok=True)
         
-
-        #all this is for printing the configuration of the training process to keep track of the arguments for a specific run
-        if is_master:
-            print(f"\n=== Configuration ===")
-            print(f"Project root: {project_root}")
-            print(f"Output directory: {args.output_dir}")
-            print(f"Task: {args.task}")
-            print(f"View: {args.view}")
-            print(f"Training approach: {args.train_approach}")
-            print(f"Backbone: {args.backbone}")
-            print(f"Batch size: {args.batch_size} per GPU")
-            print(f"Total effective batch size: {args.batch_size * world_size}")
-            print(f"Learning rate: {args.lr}")
-            print(f"Weight decay: {args.weight_decay}")
-            print(f"Epochs: {args.epochs}")
-            print(f"Workers per GPU: {args.num_workers}")
+        # Print configuration
+        print(f"\n=== Configuration ===")
+        print(f"Project root: {project_root}")
+        print(f"Output directory: {args.output_dir}")
+        print(f"Task: {args.task}")
+        print(f"View: {args.view}")
+        print(f"Training approach: {args.train_approach}")
+        print(f"Backbone: {args.backbone}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Learning rate: {args.lr}")
+        print(f"Weight decay: {args.weight_decay}")
+        print(f"Epochs: {args.epochs}")
+        print(f"Workers: {args.num_workers}")
         
         # Create datasets
-        if is_master:
-            print(f"[Process {rank}] Creating train dataset for task: {args.task}")
+        print(f"Creating train dataset for task: {args.task}")
         
-
-
-        #handles the slice count for each sample. This can be evaluated to see what the max number of slices we can use
-        #ideally we should want the max number of slices for each sample to be used that doesn't mess with the memory usage
-        start_time = time.time()
-        # Determine which view to load if using per_view approach
+        # Determine which view to load
         view_to_load = args.view
         
         # Determine max slices based on backbone model
@@ -216,13 +199,10 @@ def train_model_ddp(rank, world_size, args):
         else:  # resnet18 or others
             max_slices = 64  # Use more slices for other backbones
             
-        if is_master:
-            print(f"[Process {rank}] Using {max_slices} max slices for {args.backbone}")
+        print(f"Using {max_slices} max slices for {args.backbone}")
         
-
-
-        #setting up datasets and the loaders for those datasets
         # Create datasets with updated parameters
+        start_time = time.time()
         root = args.data_dir or get_project_root()
         train_dataset = MRNetDataset(
             root_dir=root,
@@ -232,9 +212,8 @@ def train_model_ddp(rank, world_size, args):
             max_slices=max_slices,
             view=view_to_load  # Pass the view to load
         )
-        if is_master:
-            print(f"[Process {rank}] Train dataset created in {time.time() - start_time:.2f} seconds")
-            print(f"[Process {rank}] Creating validation dataset")
+        print(f"Train dataset created in {time.time() - start_time:.2f} seconds")
+        print(f"Creating validation dataset")
         
         start_time = time.time()
         valid_dataset = MRNetDataset(
@@ -245,32 +224,20 @@ def train_model_ddp(rank, world_size, args):
             max_slices=max_slices,
             view=view_to_load  # Pass the view to load
         )
-        if is_master:
-            print(f"[Process {rank}] Validation dataset created in {time.time() - start_time:.2f} seconds")
-            print_gpu_memory_stats(rank, "after dataset creation")
-        
-        # Create distributed sampler for training data (Figure out what this is doing)
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank
-        )
-        
-        if is_master:
-            print(f"[Process {rank}] Creating data loaders with batch size {args.batch_size} and {args.num_workers} workers")
+        print(f"Validation dataset created in {time.time() - start_time:.2f} seconds")
         
         # Create data loaders
+        print(f"Creating data loaders with batch size {args.batch_size} and {args.num_workers} workers")
+        
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=False,
+            shuffle=True,  # Now we can shuffle without DistributedSampler
             num_workers=args.num_workers,
             collate_fn=custom_collate,
-            pin_memory=True,
-            sampler=train_sampler
+            pin_memory=True
         )
         
-        # Validation loader doesn't need to be distributed
         valid_loader = torch.utils.data.DataLoader(
             valid_dataset,
             batch_size=args.batch_size,
@@ -280,70 +247,36 @@ def train_model_ddp(rank, world_size, args):
             pin_memory=True
         )
         
-        if is_master:
-            print(f"[Process {rank}] Train dataset size: {len(train_dataset)}")
-            print(f"[Process {rank}] Validation dataset size: {len(valid_dataset)}")
-            print(f"[Process {rank}] Train loader batches: {len(train_loader)}")
-            print(f"[Process {rank}] Validation loader batches: {len(valid_loader)}")
-            print_gpu_memory_stats(rank, "after dataloader creation")
+        print(f"Train dataset size: {len(train_dataset)}")
+        print(f"Validation dataset size: {len(valid_dataset)}")
+        print(f"Train loader batches: {len(train_loader)}")
+        print(f"Validation loader batches: {len(valid_loader)}")
         
-
-
-
-
-        # Create models for the specified view
+        # Create model for the specified view
         models = {}
         optimizers = {}
-        schedulers = {}  # Add schedulers dictionary
+        schedulers = {}
         
-        # Determine which views to create models for
-        if args.view:
-            # If view is specified, only create model for that view
-            views_to_create = [args.view]
-            if is_master:
-                print(f"[Process {rank}] Creating model only for view: {args.view}")
-        else:
-            # If no view is specified, create models for all three views, this should not be necessary as we will always be specifying a view
-            views_to_create = ['axial', 'coronal', 'sagittal']
-            if is_master:
-                print(f"[Process {rank}] Creating models for all views")
+        # Create model
+        print(f"Creating model for view: {args.view}")
+        start_time = time.time()
+        model = MRNetModel(backbone=args.backbone)
+        model = model.to(device)
         
-        # Create a model for each view, need to simplify this for just one view
-        for view in views_to_create:
-            if is_master:
-                print(f"[Process {rank}] Creating model for view: {view}") 
-            start_time = time.time()
-            model = MRNetModel(backbone=args.backbone)
-            if args.sync_bn:
-                model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-            
-            model = model.to(device)
-            # Add find_unused_parameters=True to avoid DDP errors
-            model = DDP(model, device_ids=[rank])
-
-            #this is our optimizer, we can try different optimizers and see what works best
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            # Create learning rate scheduler, this is a simple scheduler that reduces the learning rate by 50% if the validation loss doesn't improve after 5 epochs
-            #we can evaluate different schedulers and see what works best
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=5, verbose=is_master
-            )
-            
-
-            #this is for storing the models, optimizers, and schedulers for each view
-            models[view] = model
-            optimizers[view] = optimizer
-            schedulers[view] = scheduler  # Store the scheduler
-            
-
-
-
-
-            if is_master:
-                print(f"[Process {rank}] Model for {view} created in {time.time() - start_time:.2f} seconds")
-                print_gpu_memory_stats(rank, f"after {view} model creation")
+        # Create optimizer and scheduler
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
         
-        # Loss function, determine if this is the best loss function for our model
+        # Store the model, optimizer, and scheduler
+        models[args.view] = model
+        optimizers[args.view] = optimizer
+        schedulers[args.view] = scheduler
+        
+        print(f"Model for {args.view} created in {time.time() - start_time:.2f} seconds")
+        
+        # Loss function
         criterion = torch.nn.BCEWithLogitsLoss()
         
         # Training loop
@@ -351,38 +284,34 @@ def train_model_ddp(rank, world_size, args):
         best_model_path = os.path.join(args.output_dir, f"best_model_{args.backbone}_{args.task}_{args.view}.pth")
         global_step = 0
         
-        if is_master:
-            print("\n=== Training Configuration ===")
-            print(f"Task: {args.task}")
-            print(f"View: {args.view if args.view else 'all views'}")
-            print(f"Training Approach: {args.train_approach}")
-            print(f"Backbone: {args.backbone}")
-            print(f"Batch Size: {args.batch_size} per GPU")
-            print(f"Total Batch Size: {args.batch_size * world_size}")
-            print(f"Learning Rate: {args.lr}")
-            print(f"Weight Decay: {args.weight_decay}")
-            print(f"Number of Epochs: {args.epochs}")
-            print(f"Number of GPUs: {world_size}")
-            print(f"Number of Workers per GPU: {args.num_workers}")
-            print(f"Data Augmentation: {'Enabled' if args.use_augmentation else 'Disabled'}")
-            print(f"Max Slices per MRI: {max_slices}")
-            print(f"Mixed Precision Training: {'Enabled' if use_amp else 'Disabled'}")
-            print("==============================\n")
+        print("\n=== Training Configuration ===")
+        print(f"Task: {args.task}")
+        print(f"View: {args.view}")
+        print(f"Training Approach: {args.train_approach}")
+        print(f"Backbone: {args.backbone}")
+        print(f"Batch Size: {args.batch_size}")
+        print(f"Learning Rate: {args.lr}")
+        print(f"Weight Decay: {args.weight_decay}")
+        print(f"Number of Epochs: {args.epochs}")
+        print(f"Number of Workers: {args.num_workers}")
+        print(f"Data Augmentation: {'Enabled' if args.use_augmentation else 'Disabled'}")
+        print(f"Max Slices per MRI: {max_slices}")
+        print(f"Mixed Precision Training: {'Enabled' if use_amp else 'Disabled'}")
+        print(f"Early Stopping: {'Enabled' if args.early_stopping else 'Disabled'}")
+        if args.early_stopping:
+            print(f"  - Patience: {args.early_stopping_patience} epochs")
+            print(f"  - Delta: {args.early_stopping_delta}")
+        print("==============================\n")
         
-        # Synchronize processes before starting training
-        dist.barrier()
-        
-        #main training loop
+        # Main training loop
         for epoch in range(args.epochs):
-            if is_master:
-                print(f"\n[Process {rank}] Starting epoch {epoch+1}/{args.epochs}")
-                print_gpu_memory_stats(rank, f"start of epoch {epoch+1}")
+            print(f"\nStarting epoch {epoch+1}/{args.epochs}")
             
-            # Set epoch for sampler
-            train_sampler.set_epoch(epoch)
             
             # Training phase
+            model = models[args.view]
             model.train()
+            optimizer = optimizers[args.view]
             running_loss = 0.0
             train_true = []
             train_pred = []
@@ -391,40 +320,38 @@ def train_model_ddp(rank, world_size, args):
                 try:
                     # Ensure the required view is available
                     if args.view not in batch['available_views']:
-                        if is_master and batch_idx % 20 == 0:
-                            print(f"[Process {rank}] Skipping batch {batch_idx+1} - view {args.view} not available")
+                        if batch_idx % 20 == 0:
+                            print(f"Skipping batch {batch_idx+1} - view {args.view} not available")
                         continue
                     
                     batch_start_time = time.time()
                     batch_size = batch['label'].size(0)
                     
                     # Print detailed batch info for early batches
-                    if is_master and batch_idx < 5:
+                    if batch_idx < 5:
                         print(f"\n=== Batch {batch_idx+1} Details ===")
                         print(f"Batch keys: {list(batch.keys())}")
                         print(f"Available views: {batch['available_views']}")
                         print(f"Label shape: {batch['label'].shape}")
                         for view in batch['available_views']:
                             print(f"{view} shape: {batch[view].shape}")
-                            print(f"{view} memory: {batch[view].element_size() * batch[view].nelement() / (1024**2):.2f} MB")
+                            # Calculate approximate memory usage
+                            tensor_size_mb = batch[view].element_size() * batch[view].nelement() / (1024 * 1024)
+                            print(f"{view} memory: {tensor_size_mb:.2f} MB")
                     
                     # Get labels and reshape to [batch_size, 1]
                     labels = batch['label'].to(device)
                     labels = labels.view(-1, 1)  # Reshape labels to match output
                     
-                    # Track memory before forward pass
-                    if is_master and batch_idx < 5:
-                        print_gpu_memory_stats(rank, f"before forward pass (batch {batch_idx+1})")
-                    
                     # Get the data for this view
                     data = batch[args.view].to(device)
                     
                     # Log shape information
-                    if is_master and batch_idx % 10 == 0:
-                        print(f"[Process {rank}] Processing {args.view} data with shape: {data.shape}")
+                    if batch_idx % 10 == 0:
+                        print(f"Processing {args.view} data with shape: {data.shape}")
                     
-                    optimizer = optimizers[args.view]
-                    optimizer.zero_grad() #this is for zeroing out the gradients
+                    # Zero gradients
+                    optimizer.zero_grad()
                     
                     # Forward pass with automatic mixed precision
                     with autocast(device_type='cuda', enabled=use_amp):
@@ -433,8 +360,6 @@ def train_model_ddp(rank, world_size, args):
                     # Calculate loss
                     loss = criterion(outputs, labels)
                     
-
-                    # massive piece that we need to evaluate 
                     # Backward pass with gradient scaling
                     if use_amp:
                         scaler.scale(loss).backward()
@@ -444,19 +369,17 @@ def train_model_ddp(rank, world_size, args):
                         loss.backward()
                         optimizer.step()
                     
+                    
                     running_loss += loss.item()
                     
-
-
-
                     # Store predictions and labels for AUC calculation
                     with torch.no_grad():
                         train_pred.extend(torch.sigmoid(outputs).cpu().numpy())
                         train_true.extend(labels.cpu().numpy())
                     
-                    # Log metrics from master process
+                    # Log metrics
                     log_interval = getattr(args, 'log_interval', 10)  # Default to 10 if not set
-                    if is_master and batch_idx % log_interval == 0:
+                    if batch_idx % log_interval == 0:
                         avg_loss = running_loss / (batch_idx + 1)
                         
                         # Calculate training AUC if we have enough samples
@@ -464,7 +387,7 @@ def train_model_ddp(rank, world_size, args):
                         if len(train_true) > 1 and len(np.unique(train_true)) > 1:
                             train_auc = roc_auc_score(train_true, train_pred)
                         
-                        # Log to TensorBoard, I dont know if tensorboard is the best tool for this job
+                        # Log to TensorBoard
                         if writer:
                             writer.add_scalar('Loss/train', avg_loss, global_step)
                             if train_auc > 0:
@@ -478,48 +401,40 @@ def train_model_ddp(rank, world_size, args):
                             metric_tracker.update_train(metrics, global_step)
                         
                         # Print progress
-                        print(f"[Process {rank}] Epoch {epoch}/{args.epochs} | Batch {batch_idx}/{len(train_loader)} | "
+                        print(f"Epoch {epoch}/{args.epochs} | Batch {batch_idx}/{len(train_loader)} | "
                               f"Loss: {avg_loss:.4f}" + (f" | AUC: {train_auc:.4f}" if train_auc > 0 else ""))
                     
-                    global_step += 1 #why is this needed?
+                    global_step += 1
                     
-                    # Track memory after backward pass
-                    if is_master and batch_idx < 5:
-                        print_gpu_memory_stats(rank, f"after backward pass (batch {batch_idx+1})")
-                    
-                    # Add after each batch completes
-                    if args.debug:
+                    # Call gc.collect() and empty cache occasionally to keep memory usage in check
+                    if batch_idx % 50 == 0:
                         torch.cuda.empty_cache()
                         gc.collect()
                     
                 except Exception as e:
-                    if is_master:
-                        print(f"\n=== ERROR in batch {batch_idx+1} ===")
-                        print(f"Error type: {type(e).__name__}")
-                        print(f"Error message: {str(e)}")
-                        print(f"Model: {args.view}")
-                        print(f"Batch keys: {list(batch.keys()) if 'batch' in locals() else 'Unknown'}")
-                        print(f"Available views: {batch['available_views'] if 'batch' in locals() and 'available_views' in batch else 'Unknown'}")
-                        
-                        # Print stack trace
-                        import traceback
-                        print("\nStack trace:")
-                        traceback.print_exc()
-                        
-                        # Print memory state
-                        print_gpu_memory_stats(rank, "at error")
-                        
-                        # Try to suggest potential fixes
-                        print("\nPossible fixes to try:")
-                        if "CUDA out of memory" in str(e):
-                            print("1. Reduce batch size further")
-                            print("2. Reduce max_slices value in MRNetDataset")
-                            print("3. Use a smaller backbone model")
-                            print("4. Implement gradient accumulation (effective batch size without memory increase)")
-                        elif "dimension out of range" in str(e) or "size mismatch" in str(e):
-                            print("1. Check tensor shapes throughout the pipeline")
-                            print("2. Ensure all MRIs in a batch have compatible dimensions")
-                            print("3. Review model architecture for size compatibility")
+                    print(f"\n=== ERROR in batch {batch_idx+1} ===")
+                    print(f"Error type: {type(e).__name__}")
+                    print(f"Error message: {str(e)}")
+                    print(f"Model: {args.view}")
+                    print(f"Batch keys: {list(batch.keys()) if 'batch' in locals() else 'Unknown'}")
+                    print(f"Available views: {batch['available_views'] if 'batch' in locals() and 'available_views' in batch else 'Unknown'}")
+                    
+                    # Print stack trace
+                    import traceback
+                    print("\nStack trace:")
+                    traceback.print_exc()
+                    
+                    # Try to suggest potential fixes
+                    print("\nPossible fixes to try:")
+                    if "CUDA out of memory" in str(e):
+                        print("1. Reduce batch size further")
+                        print("2. Reduce max_slices value in MRNetDataset")
+                        print("3. Use a smaller backbone model")
+                        print("4. Implement gradient accumulation (effective batch size without memory increase)")
+                    elif "dimension out of range" in str(e) or "size mismatch" in str(e):
+                        print("1. Check tensor shapes throughout the pipeline")
+                        print("2. Ensure all MRIs in a batch have compatible dimensions")
+                        print("3. Review model architecture for size compatibility")
                     
                     # Re-raise to stop training or handle as needed
                     raise e
@@ -532,76 +447,72 @@ def train_model_ddp(rank, world_size, args):
             val_loss, val_auc, val_true, val_pred = evaluate(model, device, valid_loader, criterion, args)
             
             # Log validation metrics
-            if is_master:
-                print(f"\n[Process {rank}] Epoch {epoch}/{args.epochs} completed | "
-                      f"Train Loss: {train_loss:.4f} | Train AUC: {train_auc:.4f} | "
-                      f"Val Loss: {val_loss:.4f} | Val AUC: {val_auc:.4f}")
-                
-                # Log to TensorBoard
-                if writer:
-                    writer.add_scalar('Loss/val', val_loss, global_step)
-                    writer.add_scalar('AUC/val', val_auc, global_step)
-                
-                # Update MetricTracker with validation metrics
-                if metric_tracker:
-                    val_metrics = {
-                        'loss': val_loss,
-                        'auc': val_auc
-                    }
-                    metric_tracker.update_val(val_metrics, epoch)
-                
-                # Save the best model
-                if val_auc > best_val_auc:
-                    best_val_auc = val_auc
-                    torch.save(model.module.state_dict(), best_model_path)
-                    print(f"[Process {rank}] New best model saved with Val AUC: {val_auc:.4f}")
-                
-                # Save epoch predictions for later analysis (only for best epoch)
-                if val_auc == best_val_auc and metric_tracker:
-                    np.save(os.path.join(args.output_dir, 'val_true.npy'), np.array(val_true))
-                    np.save(os.path.join(args.output_dir, 'val_pred.npy'), np.array(val_pred))
-                
-                # Adjust learning rate using the scheduler
-                scheduler = schedulers[args.view]
-                scheduler.step(val_loss)
+            print(f"\nEpoch {epoch}/{args.epochs} completed | "
+                  f"Train Loss: {train_loss:.4f} | Train AUC: {train_auc:.4f} | "
+                  f"Val Loss: {val_loss:.4f} | Val AUC: {val_auc:.4f}")
             
-            # Synchronize processes to ensure all are ready for next epoch
-            dist.barrier()
+            # Log to TensorBoard
+            if writer:
+                writer.add_scalar('Loss/val', val_loss, global_step)
+                writer.add_scalar('AUC/val', val_auc, global_step)
+            
+            # Update MetricTracker with validation metrics
+            if metric_tracker:
+                val_metrics = {
+                    'loss': val_loss,
+                    'auc': val_auc
+                }
+                metric_tracker.update_val(val_metrics, epoch)
+            
+            # Save the best model
+            if val_auc > best_val_auc:
+                best_val_auc = val_auc
+                torch.save(model.state_dict(), best_model_path)
+                print(f"New best model saved with Val AUC: {val_auc:.4f}")
+            
+            # Save epoch predictions for later analysis (only for best epoch)
+            if val_auc == best_val_auc and metric_tracker:
+                np.save(os.path.join(args.output_dir, 'val_true.npy'), np.array(val_true))
+                np.save(os.path.join(args.output_dir, 'val_pred.npy'), np.array(val_pred))
+            
+            # Adjust learning rate using the scheduler
+            scheduler = schedulers[args.view]
+            scheduler.step(val_loss)
+            
+            # Check for early stopping
+            if early_stopping and early_stopping(val_auc, model, best_model_path):
+                print(f"Early stopping triggered after {epoch+1} epochs. Best Val AUC: {best_val_auc:.4f}")
+                break
         
         # End of training - cleanup and save final metrics
-        if is_master:
-            print(f"\n[Process {rank}] Training completed | Best Val AUC: {best_val_auc:.4f}")
-            
-            # Generate training plots if we have a metric tracker
-            if metric_tracker:
-                metric_tracker.save_metrics()
-                
-                # Generate basic visualization of metrics
-                from src.utils.visualization import create_training_progress_report
-                try:
-                    # Create and save training progress report
-                    fig = create_training_progress_report(
-                        args.output_dir, 
-                        save_path=os.path.join(args.output_dir, 'training_progress.png')
-                    )
-                    print(f"[Process {rank}] Training progress report saved to {args.output_dir}")
-                except Exception as e:
-                    print(f"[Process {rank}] Error generating training report: {str(e)}")
-            
-            # Close TensorBoard writer
-            if writer:
-                writer.close()
+        print(f"\nTraining completed | Best Val AUC: {best_val_auc:.4f}")
         
-        # Cleanup DDP
-        cleanup_ddp()
+        # Generate training plots if we have a metric tracker
+        if metric_tracker:
+            metric_tracker.save_metrics()
+            
+            # Generate basic visualization of metrics
+            from src.utils.visualization import create_training_progress_report
+            try:
+                # Create and save training progress report
+                fig = create_training_progress_report(
+                    args.output_dir, 
+                    save_path=os.path.join(args.output_dir, 'training_progress.png')
+                )
+                print(f"Training progress report saved to {args.output_dir}")
+            except Exception as e:
+                print(f"Error generating training report: {str(e)}")
+        
+        # Close TensorBoard writer
+        if writer:
+            writer.close()
         
         return best_val_auc
     
     except Exception as e:
-        print(f"Error in process {rank}: {str(e)}")
+        print(f"Error during training: {str(e)}")
         import traceback
         traceback.print_exc()
-        cleanup_ddp()
         raise
 
 def evaluate(model, device, data_loader, criterion, args):
@@ -656,12 +567,6 @@ def evaluate(model, device, data_loader, criterion, args):
     
     return val_loss, val_auc, val_true, val_pred
 
-def print_system_memory():
-    """Print CPU memory usage"""
-    process = psutil.Process()
-    memory_info = process.memory_info()
-    print(f"CPU Memory Usage: {memory_info.rss / (1024 ** 3):.2f} GB")
-
 
 #this might be a duplicate function, we need to evaluate if this is necessary
 def custom_collate(batch):
@@ -702,7 +607,7 @@ def custom_collate(batch):
     return result
 
 def main():
-    parser = argparse.ArgumentParser(description='Train MRNet models with Multi-GPU support')
+    parser = argparse.ArgumentParser(description='Train MRNet models on a single GPU')
     
     # Data parameters
     parser.add_argument('--data_dir', type=str, default=None,
@@ -713,6 +618,8 @@ def main():
     parser.add_argument('--view', type=str, default=None,
                         choices=['axial', 'coronal', 'sagittal'],
                         help='MRI view to train on (for single-view training)')
+    parser.add_argument('--max_slices', type=int, default=None,
+                        help='Maximum number of slices to use per MRI volume (default: 32 for densenet121, 64 for others)')
     
     # Model parameters
     parser.add_argument('--backbone', type=str, default='resnet18',
@@ -724,7 +631,7 @@ def main():
     
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=8,
-                        help='Batch size per GPU')
+                        help='Batch size')
     parser.add_argument('--epochs', type=int, default=50,
                         help='Number of epochs to train')
     parser.add_argument('--lr', type=float, default=1e-5,
@@ -742,65 +649,38 @@ def main():
     parser.add_argument('--output_dir', type=str, default='model_outputs',
                         help='Directory to save models and logs')
     
-    # Multi-GPU specific parameters
-    parser.add_argument('--master_port', type=str, default='12355',
-                        help='Port for distributed training')
-    parser.add_argument('--sync_bn', action='store_true',
-                        help='Use synchronized batch normalization')
-    parser.add_argument('--scale_lr', action='store_true',
-                        help='Scale learning rate by number of GPUs')
-    
-    # Add a new argument to control GPU usage
-    parser.add_argument('--num_gpus', type=int, default=None,
-                        help='Number of GPUs to use (default: all available minus one)')
-    parser.add_argument('--use_all_gpus', action='store_true',
-                        help='Use all available GPUs instead of reserving one')
-    
     # Add arguments for metrics tracking and visualization
     parser.add_argument('--save_predictions', action='store_true',
                        help='Save predictions from validation and test sets for later analysis')
     parser.add_argument('--generate_plots', action='store_true',
                        help='Generate plots of training progress and model performance')
     
+    # Add early stopping parameters
+    parser.add_argument('--early_stopping', action='store_true',
+                        help='Enable early stopping')
+    parser.add_argument('--early_stopping_patience', type=int, default=2,
+                        help='Number of epochs with no improvement after which training will be stopped')
+    parser.add_argument('--early_stopping_delta', type=float, default=0.01,
+                        help='Minimum change to qualify as an improvement')
+    
     args = parser.parse_args()
     
     # Override train_approach to always be per_view
     args.train_approach = 'per_view'
     
-    # Get number of available GPUs
-    available_gpus = torch.cuda.device_count()
-    if available_gpus == 0:
-        raise ValueError("No GPUs are available. Multi-GPU training cannot proceed.")
-    
-    # Decide how many GPUs to use
-    if args.num_gpus is not None:
-        # User explicitly specified number of GPUs
-        num_gpus = min(args.num_gpus, available_gpus)
-    else:
-        # By default, use all available GPUs minus one (unless use_all_gpus is True)
-        if args.use_all_gpus:
-            num_gpus = available_gpus
-        else:
-            num_gpus = max(1, available_gpus - 1)  # Use at least 1 GPU
-    
-    # Scale learning rate if requested
-    if args.scale_lr:
-        args.lr = args.lr * num_gpus
-        print(f"Scaling learning rate to {args.lr} for {num_gpus} GPUs")
+    # Verify GPU availability
+    if not torch.cuda.is_available():
+        raise ValueError("No GPU is available. Training cannot proceed.")
     
     # Set data directory to project root if not specified
     if args.data_dir is None:
         args.data_dir = get_project_root()
     
-    print(f"Starting distributed training on {num_gpus} GPUs (out of {available_gpus} available)")
+    print(f"Starting training on GPU")
     
-    # Launch distributed training
-    mp.spawn(
-        train_model_ddp,
-        args=(num_gpus, args),
-        nprocs=num_gpus,
-        join=True
-    )
+    # Launch training
+    best_val_auc = train_model(args)
+    print(f"Training completed with best validation AUC: {best_val_auc:.4f}")
 
 if __name__ == "__main__":
     main()
