@@ -20,7 +20,7 @@ sys.path.append(project_root)
 
 # This is importing the components we have created
 from src.data_loader import MRNetDataset, SimpleMRIAugmentation
-from src.model.MRNetModel import MRNetModel, MRNetEnsemble
+from src.model.MRNetModel import MRNetModel
 from src.utils.metric_tracker import MetricTracker
 
 def get_project_root():
@@ -120,7 +120,7 @@ def train_model_ddp(rank, world_size, args):
         # Enable mixed precision training to reduce memory usage
         #this needs to be checked I don't know if this is correct but it does affect the efficiency of the model
         use_amp = True
-        scaler = GradScaler('cuda') if use_amp else None
+        scaler = GradScaler() if use_amp else None
         
         # Only print from master process
         is_master = rank == 0
@@ -223,8 +223,9 @@ def train_model_ddp(rank, world_size, args):
 
         #setting up datasets and the loaders for those datasets
         # Create datasets with updated parameters
+        root = args.data_dir or get_project_root()
         train_dataset = MRNetDataset(
-            root_dir=project_root,
+            root_dir=root,
             task=args.task,
             split='train',
             transform=SimpleMRIAugmentation(p=0.5) if args.use_augmentation else None,
@@ -237,7 +238,7 @@ def train_model_ddp(rank, world_size, args):
         
         start_time = time.time()
         valid_dataset = MRNetDataset(
-            root_dir=project_root,
+            root_dir=root,
             task=args.task,
             split='valid',
             transform=None,
@@ -318,7 +319,7 @@ def train_model_ddp(rank, world_size, args):
             
             model = model.to(device)
             # Add find_unused_parameters=True to avoid DDP errors
-            model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+            model = DDP(model, device_ids=[rank])
 
             #this is our optimizer, we can try different optimizers and see what works best
             optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -487,8 +488,9 @@ def train_model_ddp(rank, world_size, args):
                         print_gpu_memory_stats(rank, f"after backward pass (batch {batch_idx+1})")
                     
                     # Add after each batch completes
-                    torch.cuda.empty_cache()
-                    gc.collect()
+                    if args.debug:
+                        torch.cuda.empty_cache()
+                        gc.collect()
                     
                 except Exception as e:
                     if is_master:
