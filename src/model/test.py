@@ -6,10 +6,10 @@ import os
 import gc
 from torch.utils.data import DataLoader
 from src.data_loader import MRNetDataset
-from src.model.MRNetModel import MRNetModel
+from src.experiment_model.MRNetModel import MRNetModel
 import json
 import argparse
-from src.model.train_multi_gpu import get_project_root
+from src.experiment_model.train_multi_gpu import get_project_root
 from src.utils.metric_tracker import MetricTracker
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -163,6 +163,8 @@ def main():
                       help='Directory to save test results and plots')
     parser.add_argument('--generate_plots', action='store_true',
                       help='Generate visualizations for test results')
+    parser.add_argument('--no_pos_weight', action='store_true',
+                    help='Keep the test loss consistent with train by disabling/using pos_weight')
     args = parser.parse_args()
     
     # Setup output directory
@@ -234,8 +236,15 @@ def main():
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
+
+    if args.no_pos_weight:
+        pos_weight = None
+    else:
+    # Use the *test* split stats just for consistency; it does NOT affect AUC / accuracy
+        pos = test_dataset.labels["label"].mean()
+        pos_weight = torch.tensor([(1 - pos) / (pos + 1e-6)], dtype=torch.float32).to(device)
     # Create loss function
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss(**({"pos_weight": pos_weight} if pos_weight is not None else {}))
     
     # Initialize metric tracker for test results
     model_name = os.path.basename(args.model_path).replace('.pth', '')

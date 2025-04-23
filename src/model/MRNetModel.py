@@ -22,106 +22,80 @@ logger = logging.getLogger(__name__)
 
 class MRNetModel(nn.Module):
     """
-    MRNet model architecture for single-view MRI classification.
-    
-    Uses a pretrained CNN backbone (default: AlexNet) to extract features from each MRI slice,
-    then applies max pooling across slices to get the most important features from the volume.
-    Finally, a classifier MLP makes the final abnormality prediction.
+    Single-view MRNet with mean-max pooling and an optional slice-attention gate.
+    Backbone convs stay frozen at init unless unfreeze() is called later.
     """
-    
-    def __init__(self, backbone='alexnet'):
-        """
-        Initialize the MRNet model.
-        
-        Args:
-            backbone (str): The pretrained model to use as feature extractor.
-                            Options: 'alexnet', 'resnet18', 'resnet34', 'densenet121'
-        """
-        super(MRNetModel, self).__init__()
-        
-        # Set up the feature extractor backbone
-        if backbone == 'alexnet':
-            self.backbone = models.alexnet(pretrained=True)
-            feature_dim = 256 * 6 * 6  # AlexNet's output dimension
-            self.feature_extractor = self.backbone.features
-        elif backbone == 'resnet18':
-            self.backbone = models.resnet18(pretrained=True)
-            feature_dim = 512  # ResNet18's output dimension
-            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
-        elif backbone == 'resnet34':
-            self.backbone = models.resnet34(pretrained=True)
-            feature_dim = 512  # ResNet34's output dimension (same as ResNet18)
-            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
-        elif backbone == 'densenet121':
-            self.backbone = models.densenet121(pretrained=True)
-            feature_dim = self.backbone.classifier.in_features  # DenseNet specific
-            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
+    def __init__(self, backbone: str = "resnet18", train_backbone: bool = False):
+        super().__init__()
+        self.backbone_type = backbone.lower()
+
+        # ---------- 1.  Feature extractor ----------
+        if self.backbone_type == "resnet18":
+            net = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+            self.feature_dim = 512
+            self.feature_extractor = nn.Sequential(*list(net.children())[:-1])  # (B,512,1,1)
+        elif self.backbone_type == "resnet34":
+            net = models.resnet34(weights=models.ResNet34_Weights.DEFAULT)
+            self.feature_dim = 512                       # same dimensionality as resnet18
+            self.feature_extractor = nn.Sequential(*list(net.children())[:-1])
+        elif self.backbone_type == "densenet121":
+            net = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
+            self.feature_dim = net.classifier.in_features           # 1024
+            self.feature_extractor = nn.Sequential(*list(net.children())[:-1])  # (B,1024,7,7)
+        elif self.backbone_type == "alexnet":
+            net = models.alexnet(weights=models.AlexNet_Weights.DEFAULT)
+            self.feature_dim = 256
+            self.feature_extractor = net.features                   # (B,256,6,6)
         else:
-            raise ValueError(f"Unsupported backbone: {backbone}")
-        
-        # Global average pooling for variable slice count
+            raise ValueError(f"Unsupported backbone {backbone}")
+
+        # freeze convs by default
+        if not train_backbone:
+            for p in self.feature_extractor.parameters():
+                p.requires_grad = False
+
+        # project DenseNet/AlexNet to 1×1 like ResNet for pooling
         self.global_pool = nn.AdaptiveAvgPool2d(1)
-        
-        # MLP classifier that takes feature vectors and outputs abnormality prediction
-        self.classifier = nn.Sequential(
-            nn.Linear(feature_dim, 1024),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(1024, 1)
+
+        # ---------- 2.  Attention gate across slices ----------
+        self.slice_attn = nn.Sequential(
+            nn.Linear(self.feature_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1, bias=False)      # scalar weight per slice
         )
-        
-        logger.info(f"Initialized MRNetModel with {backbone} backbone")
-        
+
+        # ---------- 3.  Classifier ----------
+        self.classifier = nn.Sequential(
+            nn.BatchNorm1d(self.feature_dim * 2),  # for concat of mean & max
+            nn.Dropout(0.5),
+            nn.Linear(self.feature_dim * 2, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(512, 1)
+        )
+
+    @torch.no_grad()
+    def unfreeze(self, pct=1.0):
+        """Gradually unfreeze a fraction pct ∈ (0,1] of backbone layers."""
+        total = len(list(self.feature_extractor.parameters()))
+        for i, p in enumerate(self.feature_extractor.parameters()):
+            if i / total >= 1 - pct:
+                p.requires_grad = True
+
     def forward(self, x):
-        """
-        Forward pass through the model.
-        
-        Args:
-            x: Input tensor of shape [batch_size, num_slices, channels, height, width]
-                For MRNet this is typically [batch_size, variable_slices, 3, 224, 224]
-        
-        Returns:
-            Tensor of shape [batch_size, 1] with the abnormality prediction
-        """
-        # Extract dimensions from input
-        batch_size, num_slices, channels, height, width = x.shape
-        
-        # Reshape to process all slices as a batch
-        x = x.view(batch_size * num_slices, channels, height, width)
-        
-        # Extract features from all slices
-        features = self.feature_extractor(x)
-        
-        # Get the shape of the feature tensor for proper reshaping
-        feature_shape = features.shape
-        
-        # Get the total elements per slice to avoid shape mismatches
-        elements_per_slice = features.size(1) * features.size(2) * features.size(3) if len(feature_shape) > 3 else features.size(1)
-        total_elements = features.numel()
-        elements_per_batch = total_elements // batch_size
-        
-        # Reshape back to separate batches and slices dynamically based on feature dimensions
-        if isinstance(self.backbone, models.AlexNet):
-            # For AlexNet, features shape is [batch*slices, 256, 6, 6]
-            features = features.view(batch_size, num_slices, 256, 6, 6)
-        elif isinstance(self.backbone, models.DenseNet):
-            # For DenseNet, the features need to be flattened first due to its structure
-            features = self.global_pool(features)  # Apply global pooling to get [batch*slices, features, 1, 1]
-            features = features.view(batch_size, num_slices, -1)  # Reshape to [batch, slices, features]
-        else:  # For ResNet
-            # For ResNet, features shape is [batch*slices, 512, 1, 1]
-            features = features.view(batch_size, num_slices, 512, 1, 1)
-        
-        # Apply max pooling across slices to get the most important features
-        if isinstance(self.backbone, models.DenseNet):
-            # Already flattened, just max pool across slices
-            features = torch.max(features, dim=1)[0]
-        else:
-            # For other models, max pool then flatten
-            features = torch.max(features, dim=1)[0]
-            features = features.view(batch_size, -1)
-        
-        # Apply the classifier to get final prediction
-        output = self.classifier(features)
-        
-        return output
+        # x shape  (B, S, C, H, W)
+        B, S, C, H, W = x.shape
+        x = x.view(B * S, C, H, W)
+
+        feats = self.feature_extractor(x)          # (B·S, C', h?, w?)
+        feats = self.global_pool(feats).flatten(1) # (B·S, C')
+        feats = feats.view(B, S, -1)               # (B, S, C')
+
+        # attention weights → (B,S,1) then softmax
+        attn = self.slice_attn(feats).softmax(dim=1)   # (B,S,1)
+
+        mean_pool = (feats * attn).sum(dim=1)          # (B, C')
+        max_pool  = feats.max(dim=1).values            # (B, C')
+        pooled    = torch.cat([mean_pool, max_pool], dim=1)
+
+        return self.classifier(pooled)
