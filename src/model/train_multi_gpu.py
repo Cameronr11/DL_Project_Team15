@@ -38,44 +38,46 @@ from src.experiment_model.MRNetModel import MRNetModel
 # ╭────────────────────────────────────────────────────────────────────────────╮
 # │ Early stopping                                                            │
 # ╰────────────────────────────────────────────────────────────────────────────╯
-class EarlyStopping:
-    def __init__(self, patience=7, delta=0.0, mode="max", verbose=True):
-        self.patience, self.delta, self.mode, self.verbose = patience, delta, mode, verbose
-        self.best = None
-        self.counter, self.stop = 0, False
+class DualEarlyStopping:
+    def __init__(self, patience=7, delta=0.0, verbose=True):
+        self.patience = patience
+        self.delta = delta
+        self.verbose = verbose
+        self.best_auc = float('-inf')
+        self.best_loss = float('inf')
+        self.counter = 0
+        self.stop = False
 
-    def __call__(self, metric, model=None, path=None):
-        # 1️⃣ First time through → save metric and (optionally) the model
-        if self.best is None:
-            self.best = metric
+    def __call__(self, val_auc, val_loss, model=None, path=None):
+        auc_improved = val_auc > self.best_auc + self.delta
+        loss_improved = val_loss < self.best_loss - self.delta
+
+        # Update best values regardless of counter logic
+        if auc_improved:
+            self.best_auc = val_auc
+        if loss_improved:
+            self.best_loss = val_loss
+
+        # Only save model when either metric improves
+        if auc_improved or loss_improved:
             if model and path:
                 torch.save(model.state_dict(), path)
                 if self.verbose:
-                    print(f"✨  New best model saved ({self.mode}: {metric:.4f})")
-            return False  # do not stop
-
-        # 2️⃣ Compare against the best so far
-        if self.mode == "min":
-            improved = metric < self.best - self.delta
-        else:  # "max"
-            improved = metric > self.best + self.delta
-
-        if improved:
-            self.best = metric
-            self.counter = 0
-            if model and path:
-                torch.save(model.state_dict(), path)
-                if self.verbose:
-                    print(f"✨  New best model saved ({self.mode}: {metric:.4f})")
-        else:
+                    print(f"✨  Saved new best model (AUC: {val_auc:.4f}, Loss: {val_loss:.4f})")
+        
+        # Only increment counter when BOTH metrics fail to improve
+        if not auc_improved and not loss_improved:
             self.counter += 1
             if self.verbose:
-                print(f"Early-stop counter {self.counter}/{self.patience}")
+                print(f"⏳  Early-stop counter {self.counter}/{self.patience}")
             if self.counter >= self.patience:
                 self.stop = True
+                print("🛑  Early stopping triggered.")
+        else:
+            # Reset counter if either metric improves
+            self.counter = 0
 
         return self.stop
-
 
 
 # ╭────────────────────────────────────────────────────────────────────────────╮
@@ -207,9 +209,9 @@ def train(args) -> float:
     writer = SummaryWriter(os.path.join(args.output_dir, "logs"))
     json.dump(vars(args), open(Path(args.output_dir) / "args.json", "w"), indent=4)
 
-    early_stop = EarlyStopping(patience=args.early_stopping_patience,
-                               delta=args.early_stopping_delta,
-                               mode="max", verbose=True)
+    early_stop = DualEarlyStopping(patience=args.early_stopping_patience,
+                                   delta=args.early_stopping_delta,
+                                   verbose=True)
 
     best_val_auc = 0.0
     for epoch in range(args.epochs):
@@ -219,11 +221,11 @@ def train(args) -> float:
         if epoch == unfreeze_at:
             print(f"🔓  Unfreezing top 30 % of backbone at epoch {epoch}")
             model.unfreeze(0.30)                          # enable grads on top 30 %
-            # bump the *existing* backbone param-group’s LR instead of adding a new one
+            # bump the *existing* backbone param-group's LR instead of adding a new one
             backbone_lr = args.lr * 0.03                  # small LR for frozen layers
             optimizer.param_groups[0]["lr"] = backbone_lr
             print(f"    Backbone learning-rate set to {backbone_lr:g}")
-            
+
         t0 = time.time()
         train_loss, train_auc = run_epoch(model, train_loader, criterion, optimizer, scaler,
                                           device, use_amp, train=True,  epoch=epoch,
@@ -240,7 +242,7 @@ def train(args) -> float:
               f"Train loss {train_loss:.4f}  AUC {train_auc:.3f} | "
               f"Val loss {val_loss:.4f}  AUC {val_auc:.3f} | {time.time()-t0:.1f}s")
 
-        if early_stop(val_auc, model, Path(args.output_dir) / "best_model.pth"):
+        if early_stop(val_auc, val_loss, model, Path(args.output_dir) / "best_model.pth"):
             print("⏹️  Early stopping triggered.")
             break
 
