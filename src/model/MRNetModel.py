@@ -78,6 +78,14 @@ class MRNetModel(nn.Module):
     def unfreeze(self, pct=1.0):
         """Gradually unfreeze a fraction pct ∈ (0,1] of backbone layers."""
         total = len(list(self.feature_extractor.parameters()))
+        
+        # Special case for full unfreezing to ensure all parameters are unfrozen
+        if pct >= 1.0:
+            for p in self.feature_extractor.parameters():
+                p.requires_grad = True
+            return
+            
+        # Handle partial unfreezing
         for i, p in enumerate(self.feature_extractor.parameters()):
             if i / total >= 1 - pct:
                 p.requires_grad = True

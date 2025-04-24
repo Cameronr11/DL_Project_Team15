@@ -31,7 +31,8 @@ sys.path.append(str(project_root))
 
 from src.data_loader import MRNetDataset, custom_collate
 from src.data_augmentation_scheduler import DataAugmentationScheduler
-from src.experiment_model.MRNetModel import MRNetModel
+from src.data_augmentation import SimpleMRIAugmentation
+from src.experiment_model2.MRNetModel import MRNetModel
 # ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -172,11 +173,20 @@ def train(args) -> float:
 
     criterion = nn.BCEWithLogitsLoss(**({"pos_weight": pos_weight} if pos_weight is not None else {}))
 
-    aug_sched = (DataAugmentationScheduler(args.epochs, phase1=0.1, phase2=0.5,
+    # Set up data augmentation
+    if args.use_da_scheduler:
+        print("Using data augmentation scheduler with three phases")
+        aug_sched = DataAugmentationScheduler(args.epochs, phase1=0.1, phase2=0.5,
                                            max_rot=12.0, max_brightness=0.12)
-                 if args.use_da_scheduler else None)
-    if aug_sched:
         train_ds.set_transform(aug_sched.get_transform(0))
+    elif args.use_simple_da:
+        print("Using simple data augmentation with fixed parameters")
+        simple_aug = SimpleMRIAugmentation(p=0.5, rotation_degrees=8.0, brightness_factor=0.1)
+        train_ds.set_transform(simple_aug)
+    else:
+        print("No data augmentation will be used")
+        aug_sched = None
+        train_ds.set_transform(None)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True,
@@ -188,13 +198,16 @@ def train(args) -> float:
     # ── Model ───────────────────────────────────────────────────────────────
     model = MRNetModel(backbone=args.backbone, train_backbone=True).to(device)
     model.view = args.view
-    unfreeze_at = max(3, args.epochs // 4)
+    unfreeze_at = max(2, args.epochs // 8)  # Unfreeze much earlier
+
+    # Define a second unfreeze point for complete unfreezing
+    full_unfreeze_at = max(5, args.epochs // 3)
 
     head_params     = list(model.classifier.parameters()) + list(model.slice_attn.parameters())
     backbone_params = list(model.feature_extractor.parameters())        # all backbone layers
 
     optimizer = torch.optim.AdamW(
-        [ {"params": backbone_params, "lr": 0.0},        # ← frozen via lr = 0
+        [ {"params": backbone_params, "lr": args.lr * 0.01},  # Small but non-zero LR instead of freezing
           {"params": head_params,     "lr": args.lr} ],
         weight_decay=args.weight_decay
     )
@@ -215,14 +228,22 @@ def train(args) -> float:
 
     best_val_auc = 0.0
     for epoch in range(args.epochs):
-        if aug_sched:
+        if args.use_da_scheduler and aug_sched:
             train_ds.set_transform(aug_sched.get_transform(epoch))
 
         if epoch == unfreeze_at:
-            print(f"🔓  Unfreezing top 30 % of backbone at epoch {epoch}")
-            model.unfreeze(0.30)                          # enable grads on top 30 %
-            # bump the *existing* backbone param-group's LR instead of adding a new one
-            backbone_lr = args.lr * 0.03                  # small LR for frozen layers
+            print(f"🔓  Unfreezing top 70% of backbone at epoch {epoch}")
+            model.unfreeze(0.70)                          # enable grads on top 70%
+            # increase backbone learning rate
+            backbone_lr = args.lr * 0.1                   # higher LR for adaptation
+            optimizer.param_groups[0]["lr"] = backbone_lr
+            print(f"    Backbone learning-rate set to {backbone_lr:g}")
+
+        if epoch == full_unfreeze_at:
+            print(f"🔓  Unfreezing all backbone layers at epoch {epoch}")
+            model.unfreeze(1.0)                           # enable grads on all layers
+            # increase backbone learning rate further
+            backbone_lr = args.lr * 0.1                   # higher LR for full adaptation
             optimizer.param_groups[0]["lr"] = backbone_lr
             print(f"    Backbone learning-rate set to {backbone_lr:g}")
 
@@ -276,7 +297,10 @@ def get_parser():
     p.add_argument("--log_interval", type=int, default=50,
                    help="Print batch stats every N batches")
     # Augmentation
-    p.add_argument("--use_da_scheduler", action="store_true")
+    p.add_argument("--use_da_scheduler", action="store_true",
+                  help="Use the three-phase data augmentation scheduler")
+    p.add_argument("--use_simple_da", action="store_true",
+                  help="Use simple data augmentation with fixed parameters")
     # Early stop
     p.add_argument("--early_stopping_patience", type=int, default=3)
     p.add_argument("--early_stopping_delta", type=float, default=0.005)
@@ -293,6 +317,10 @@ def get_parser():
 # ╰────────────────────────────────────────────────────────────────────────────╯
 if __name__ == "__main__":
     args = get_parser().parse_args()
+
+    # Check for incompatible augmentation options
+    if args.use_da_scheduler and args.use_simple_da:
+        raise ValueError("Cannot use both --use_da_scheduler and --use_simple_da together. Please choose one.")
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA device required.")
