@@ -32,7 +32,7 @@ sys.path.append(str(project_root))
 from src.data_loader import MRNetDataset, custom_collate
 from src.data_augmentation_scheduler import DataAugmentationScheduler
 from src.data_augmentation import SimpleMRIAugmentation
-from src.experiment_model2.MRNetModel import MRNetModel
+from src.model.MRNetModel import MRNetModel
 # ───────────────────────────────────────────────────────────────────────────────
 
 
