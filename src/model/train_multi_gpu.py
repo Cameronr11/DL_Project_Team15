@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
 from sklearn.metrics import roc_auc_score
+import matplotlib.pyplot as plt
 
 # ───────────────────────────────────────────────────────────────────────────────
 #  Local imports
@@ -154,6 +155,27 @@ def run_epoch(model, loader, criterion, optimizer, scaler,
 # │ Main training routine                                                     │
 # ╰────────────────────────────────────────────────────────────────────────────╯
 def train(args) -> float:
+
+
+    #adding this inner function to plot the training and validation losses and aucs
+    def plot_training_curves(train_vals, val_vals, ylabel, save_path):
+        plt.figure(figsize=(8, 6))
+        epochs = list(range(1, len(train_vals) + 1))
+        plt.plot(epochs, train_vals, label='Train', marker='o')
+        plt.plot(epochs, val_vals, label='Validation', marker='o')
+        plt.xlabel('Epoch')
+        plt.ylabel(ylabel)
+        plt.title(f'{ylabel} over Epochs')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300)
+        plt.close()
+
+    train_losses = []
+    val_losses = []
+    train_aucs = []
+    val_aucs = []
     device = torch.device("cuda:0")
     torch.cuda.set_device(0)
 
@@ -196,7 +218,8 @@ def train(args) -> float:
                               collate_fn=custom_collate)
 
     # ── Model ───────────────────────────────────────────────────────────────
-    model = MRNetModel(backbone=args.backbone, train_backbone=True).to(device)
+    model = MRNetModel(backbone=args.backbone, train_backbone=False, use_attention=not args.no_attention).to(device)
+
     model.view = args.view
     unfreeze_at = max(2, args.epochs // 8)  # Unfreeze much earlier
 
@@ -262,12 +285,28 @@ def train(args) -> float:
         print(f"[{epoch+1:03d}/{args.epochs}]  "
               f"Train loss {train_loss:.4f}  AUC {train_auc:.3f} | "
               f"Val loss {val_loss:.4f}  AUC {val_auc:.3f} | {time.time()-t0:.1f}s")
+        
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_aucs.append(train_auc)
+        val_aucs.append(val_auc)
+
+
+
 
         if early_stop(val_auc, val_loss, model, Path(args.output_dir) / "best_model.pth"):
             print("⏹️  Early stopping triggered.")
             break
 
         best_val_auc = max(best_val_auc, val_auc)
+
+
+
+    #plotting the training and validation losses and aucs as visualizations
+    plot_training_curves(train_losses, val_losses, "Loss", os.path.join(args.output_dir, "loss_curve.png"))
+    plot_training_curves(train_aucs, val_aucs, "AUC", os.path.join(args.output_dir, "auc_curve.png"))
+
+
 
     writer.close()
     return best_val_auc
@@ -303,12 +342,15 @@ def get_parser():
                   help="Use simple data augmentation with fixed parameters")
     # Early stop
     p.add_argument("--early_stopping_patience", type=int, default=3)
-    p.add_argument("--early_stopping_delta", type=float, default=0.005)
+    p.add_argument("--early_stopping_delta", type=float, default=0.003)
     # Misc
     #this flag is used to disable class-imbalance weighting in BCE loss
     p.add_argument("--no_pos_weight", action="store_true",
                    help="Disable class-imbalance weighting in BCE loss")
     p.add_argument("--output_dir", type=str, default="results/run1")
+    p.add_argument("--no_attention", action="store_true",
+               help="Disable slice attention and use uniform pooling instead")
+
     return p
 
 

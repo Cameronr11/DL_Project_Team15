@@ -25,10 +25,10 @@ class MRNetModel(nn.Module):
     Single-view MRNet with mean-max pooling and an optional slice-attention gate.
     Backbone convs stay frozen at init unless unfreeze() is called later.
     """
-    def __init__(self, backbone: str = "resnet18", train_backbone: bool = False):
+    def __init__(self, backbone: str = "resnet34", train_backbone: bool = False, use_attention: bool = True):
         super().__init__()
         self.backbone_type = backbone.lower()
-
+        self.use_attention = use_attention
         # ---------- 1.  Feature extractor ----------
         if self.backbone_type == "resnet18":
             net = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
@@ -99,11 +99,16 @@ class MRNetModel(nn.Module):
         feats = self.global_pool(feats).flatten(1) # (B·S, C')
         feats = feats.view(B, S, -1)               # (B, S, C')
 
-        # attention weights → (B,S,1) then softmax
-        attn = self.slice_attn(feats).softmax(dim=1)   # (B,S,1)
+        if self.use_attention:
+            attn = self.slice_attn(feats).softmax(dim=1)         # (B, S, 1)
+            mean_pool = (feats * attn).sum(dim=1)                # (B, C')
+        else:
+            # Use uniform attention (mean pooling)
+            attn = torch.ones((B, S, 1), device=feats.device) / S
+            mean_pool = feats.mean(dim=1)                        # (B, C')
 
-        mean_pool = (feats * attn).sum(dim=1)          # (B, C')
-        max_pool  = feats.max(dim=1).values            # (B, C')
-        pooled    = torch.cat([mean_pool, max_pool], dim=1)
+        max_pool = feats.max(dim=1).values                       # (B, C')
+        pooled = torch.cat([mean_pool, max_pool], dim=1)         # (B, 2C')
 
         return self.classifier(pooled)
+

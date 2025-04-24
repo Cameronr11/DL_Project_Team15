@@ -308,55 +308,69 @@ def main():
 
 # We'll create our own plotting functions instead of importing non-existent ones
 def plot_confusion_matrix(y_true, y_pred, save_path=None):
-    """Plot confusion matrix."""
+    """Plot a polished confusion matrix for presentations."""
     cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.title('Confusion Matrix')
-    
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(
+        cm, annot=True, fmt='d', cmap='Blues', cbar=False, square=True,
+        annot_kws={"size": 14}, linewidths=0.5, linecolor='gray'
+    )
+    plt.title("Confusion Matrix", fontsize=14, fontweight='bold')
+    plt.xlabel("Predicted Label", fontsize=12)
+    plt.ylabel("True Label", fontsize=12)
+    plt.xticks(fontsize=10)
+    plt.yticks(fontsize=10)
+    plt.tight_layout()
+
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    
     return plt.gcf()
 
 def plot_roc_curve(y_true, y_score, save_path=None):
-    """Plot ROC curve."""
-    from sklearn.metrics import roc_curve
+    """Plot a polished ROC curve with AUC for presentation."""
+    from sklearn.metrics import roc_curve, auc
     fpr, tpr, _ = roc_curve(y_true, y_score)
-    roc_auc = np.trapz(tpr, fpr)  # Area under ROC curve
-    
-    plt.figure(figsize=(8, 6))
-    plt.plot(fpr, tpr, label=f'ROC curve (AUC = {roc_auc:.3f})')
-    plt.plot([0, 1], [0, 1], 'k--')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('ROC Curve')
-    plt.legend(loc='lower right')
-    plt.grid(True)
-    
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure(figsize=(6, 5))
+    plt.plot(fpr, tpr, color='blue', lw=2, label=f'AUC = {roc_auc:.3f}')
+    plt.plot([0, 1], [0, 1], color='gray', linestyle='--', lw=1)
+    plt.title('ROC Curve', fontsize=14, fontweight='bold')
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate', fontsize=12)
+    plt.legend(loc='lower right', fontsize=10)
+    plt.xticks(fontsize=10)
+    plt.yticks(fontsize=10)
+    plt.grid(True, linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    
     return plt.gcf()
 
+
 def plot_precision_recall_curve(y_true, y_score, save_path=None):
-    """Plot precision-recall curve."""
-    from sklearn.metrics import precision_recall_curve
+    """Plot a polished precision-recall curve for presentation."""
+    from sklearn.metrics import precision_recall_curve, average_precision_score
     precision, recall, _ = precision_recall_curve(y_true, y_score)
-    
-    plt.figure(figsize=(8, 6))
-    plt.plot(recall, precision)
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title('Precision-Recall Curve')
-    plt.grid(True)
-    
+    ap = average_precision_score(y_true, y_score)
+
+    plt.figure(figsize=(6, 5))
+    plt.plot(recall, precision, color='green', lw=2, label=f'AP = {ap:.3f}')
+    plt.xlabel('Recall', fontsize=12)
+    plt.ylabel('Precision', fontsize=12)
+    plt.title('Precision-Recall Curve', fontsize=14, fontweight='bold')
+    plt.legend(loc='lower left', fontsize=10)
+    plt.xticks(fontsize=10)
+    plt.yticks(fontsize=10)
+    plt.grid(True, linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    
+
     return plt.gcf()
+
 
 if __name__ == "__main__":
     main()
