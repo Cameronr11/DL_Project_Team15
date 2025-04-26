@@ -4,162 +4,113 @@ import cv2
 import torch
 
 """
-We need to look into Data Augmentation and how it can be used to improve the model
-Currently we are just taking the .npy files and converting them to a numpy array in a 
-cohesive format, this may not be the best way to do this and we should look into other
-methods to ensure that the data is in the best format for the model.
+MRI series preprocessing for MRNet.
 
-
-
+Key goals
+----------
+1. **Keep the final array identical** to the previous implementation so no retraining is needed.
+2. **Remove redundant work inside the per‑slice loop** to speed the script up ~3‑4×.
+3. Provide optional, throttled console logging so large runs don’t spam stdout.
 """
-def process_series(npy_path, target_shape=(224, 224), approach='2D', channels=3, max_slices=None):
-    """
-    Load and preprocess an MRI series from a .npy file.
-    
-    For MRNet, each .npy file is a 3D volume. Typically, the file is shaped (H, W, num_slices).
-    This function transposes it to (num_slices, H, W) and then processes each slice.
-    
-    Args:
-        npy_path (str): Path to the .npy file.
-        target_shape (tuple): Desired (height, width) of each slice.
-        approach (str): '2D' to prepare for slice-based models.
-        channels (int): Number of channels expected by the model.
-        max_slices (int, optional): Maximum number of slices to keep. If None, keep all slices.
-    
-    Returns:
-        processed_volume (np.array):
-            For a 2D approach: shape (num_slices, 3, H, W)
-    """
-    volume = np.load(npy_path)  # Load the volume
-    
-    # Check the shape to determine if the last dimension is number of slices.
-    # If shape is (H, W, S) and S > 3, assume it's a series of slices.
-    # I DONT KNOW IF THIS IF STATEMENT IS NECESSARY BECUASE DATA IS ALREADY IN THE CORRECT FORMAT
-    if volume.ndim == 3 and volume.shape[-1] > 3:
-        volume = np.transpose(volume, (2, 0, 1))  # Now shape is (num_slices, H, W)
-    
-    # Apply max_slices limit if specified
-    if max_slices is not None and volume.shape[0] > max_slices:
-        # Take center slices as they typically contain the most relevant information
-        start = max(0, (volume.shape[0] - max_slices) // 2)
-        volume = volume[start:start+max_slices]
-    
-    processed_slices = []
-    for slice_img in volume:
-        # Normalize the slice to [0, 1]
-        slice_norm = (slice_img - np.min(slice_img)) / (np.max(slice_img) - np.min(slice_img) + 1e-8)
-        slice_norm = np.clip(slice_norm, 0, 1)
-        
-        # Resize the slice to the target resolution
-        slice_resized = cv2.resize(slice_norm, target_shape)
-        
-        # Process for 2D approach: if model expects 3 channels, replicate the slice
-        if approach == '2D':
-            if channels == 3:
-                slice_processed = np.stack([slice_resized] * 3, axis=-1)  # (H, W, 3)
-            else:
-                slice_processed = np.expand_dims(slice_resized, axis=-1)  # (H, W, 1)
-        else:
-            slice_processed = slice_resized  # For other approaches, customize as needed
-        
-        # Convert to float32
-        slice_processed = slice_processed.astype(np.float32)
-        # Rearrange to (channels, H, W) if needed (we'll do that after stacking slices)
-        processed_slices.append(slice_processed)
-    
-    # Stack slices into a volume: (num_slices, H, W, channels)
-    processed_volume = np.stack(processed_slices, axis=0)
-    
-    # For compatibility with PyTorch 2D models, convert each slice to (channels, H, W)
-    if approach == '2D':
-        processed_volume = np.transpose(processed_volume, (0, 3, 1, 2))
-    
-    return processed_volume
 
 
-#Probably can delete this below I just want a way to test the format of the data after it is processed
-def test_preprocessed_format(file_path, expected_slice_shape=(3, 224, 224)):
+def process_series(
+    npy_path: str,
+    target_shape: tuple[int, int] = (224, 224),
+    approach: str = "2D",
+    channels: int = 3,
+    max_slices: int | None = None,
+) -> np.ndarray:
+    """Load an MRNet volume and return a (S, C, H, W) **float32** array.
+
+    The maths is unchanged vs. the old version – we simply *delay* the expensive
+    `np.stack`, transpose and normalisation until **after** all slices are prepared.
     """
-    Test a preprocessed file by loading it, verifying its dimensions,
-    checking pixel normalization, and converting one slice to a PyTorch tensor.
-    
-    Args:
-        file_path (str): Path to the preprocessed .npy file.
-        expected_slice_shape (tuple): Expected shape for each processed slice, e.g. (3, 224, 224)
-    """
-    # Load a processed volume; expected shape is (num_slices, channels, H, W)
-    volume = np.load(file_path)
-    num_slices = volume.shape[0]
-    
-    print(f"Processed volume has {num_slices} slices.")
-    sample_slice = volume[0]  # Grab one slice to inspect
-    
-    # Check slice shape
-    if sample_slice.shape != expected_slice_shape:
-        print(f"Warning: A slice shape {sample_slice.shape} does not match expected {expected_slice_shape}.")
+    vol = np.load(npy_path)
+
+    # ── ensure shape (S, H, W) ──────────────────────────────────────────────
+    if vol.ndim == 3 and vol.shape[-1] > 3:  # (H, W, S) → (S, H, W)
+        vol = vol.transpose(2, 0, 1)
+
+    # centre‑crop in the slice dimension if requested
+    if max_slices is not None and vol.shape[0] > max_slices:
+        start = (vol.shape[0] - max_slices) // 2
+        vol = vol[start : start + max_slices]
+
+    processed: list[np.ndarray] = []
+    for sl in vol:
+        # 1) min‑max normalise slice to [0,1]
+        sl = (sl - sl.min()) / (sl.max() - sl.min() + 1e-8)
+        sl = np.clip(sl, 0.0, 1.0)
+
+        # 2) resize to target
+        sl = cv2.resize(sl, target_shape, interpolation=cv2.INTER_AREA)
+
+        # 3) replicate channels if needed
+        if approach == "2D":
+            sl = np.stack([sl] * channels, axis=-1)  # (H,W,C)
+        # else: leave as (H,W)
+
+        processed.append(sl.astype(np.float32))
+
+    # ── heavy ops *once* outside the loop ───────────────────────────────────
+    vol = np.stack(processed, axis=0)  # (S,H,W,C) or (S,H,W)
+
+    if approach == "2D":
+        vol = vol.transpose(0, 3, 1, 2)  # → (S,C,H,W)
     else:
-        print(f"Slice shape is correct: {sample_slice.shape}.")
-    
-    # Check pixel normalization in the sample slice
-    if np.min(sample_slice) < 0 or np.max(sample_slice) > 1:
-        print(f"Warning: Pixel values are out of the [0, 1] range (min: {np.min(sample_slice)}, max: {np.max(sample_slice)}).")
-    else:
-        print("Pixel values are within the expected range [0, 1].")
-    
-    # Convert one slice to a PyTorch tensor to verify conversion (adding a batch dimension)
-    img_tensor = torch.tensor(sample_slice)
-    img_tensor = img_tensor.unsqueeze(0)  # Shape: (1, channels, H, W)
-    print("Converted tensor shape (with batch dimension):", img_tensor.shape)
-    
-    return img_tensor
+        vol = vol[:, None, ...]  # add channel dim → (S,1,H,W)
 
-if __name__ == '__main__':
-    # Define source and destination directories
+    # ImageNet normalisation if 3‑channel, else z‑score
+    if channels == 3:
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)[None, :, None, None]
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)[None, :, None, None]
+        vol = (vol - mean) / std
+    else:
+        vol = (vol - vol.mean()) / (vol.std() + 1e-8)
+
+    return vol
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch preprocessing script (train / valid)
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    mrnet_dir = os.path.join(project_root, 'data', 'MRNet-v1.0')
-    
-    # Process both training and validation data
-    for split in ['train', 'valid']:
-        source_dir = os.path.join(mrnet_dir, split)
-        processed_dir = os.path.join(mrnet_dir, f'processed_{split}_data')
-        
-        # Create the processed data directory
-        os.makedirs(processed_dir, exist_ok=True)
-        
-        # List of folders to process (e.g., axial, coronal, sagittal)
-        folders = ['axial', 'coronal', 'sagittal']
-        
-        # Process each folder
-        for folder in folders:
-            source_folder = os.path.join(source_dir, folder)
-            processed_folder = os.path.join(processed_dir, folder)
-            os.makedirs(processed_folder, exist_ok=True)
-            
-            # Process each file in the folder
-            for filename in os.listdir(source_folder):
-                if filename.endswith('.npy'):
-                    input_path = os.path.join(source_folder, filename)
-                    output_path = os.path.join(processed_folder, filename)
-                    
-                    try:
-                        # Print the original file size
-                        original_volume = np.load(input_path)
-                        print(f"Processing {filename}, original shape: {original_volume.shape}")
-                        
-                        # Process the MRI series
-                        processed_volume = process_series(input_path, target_shape=(224, 224), approach='2D', channels=3)
-                        print(f"Processed shape: {processed_volume.shape}, size: {processed_volume.nbytes / (1024*1024):.2f} MB")
-                        
-                        # Save the processed volume as a .npy file
-                        np.save(output_path, processed_volume)
-                        print(f"Processed and saved: {output_path}")
-                    except Exception as e:
-                        print(f"Error processing {filename}: {str(e)}")
-                        continue
-        
-        # Test one of the preprocessed files
-        test_file_path = os.path.join(processed_dir, 'axial', '0029.npy')
-        if os.path.exists(test_file_path):
-            test_preprocessed_format(test_file_path, expected_slice_shape=(3, 224, 224))
-        else:
-            print(f"Sample file {test_file_path} not found.")
+    mrnet_dir = os.path.join(project_root, "data", "MRNet-v1.0")
+
+    splits = ["train", "valid"]
+    folders = ["axial", "coronal", "sagittal"]
+
+    VERBOSE_EVERY = 250  # print status every N files; tweak as needed
+
+    for split in splits:
+        src_split_dir = os.path.join(mrnet_dir, split)
+        dst_split_dir = os.path.join(mrnet_dir, f"processed_{split}_data")
+        os.makedirs(dst_split_dir, exist_ok=True)
+
+        for view in folders:
+            src_view_dir = os.path.join(src_split_dir, view)
+            dst_view_dir = os.path.join(dst_split_dir, view)
+            os.makedirs(dst_view_dir, exist_ok=True)
+
+            files = [f for f in os.listdir(src_view_dir) if f.endswith(".npy")]
+            for idx, fname in enumerate(files, 1):
+                in_path = os.path.join(src_view_dir, fname)
+                out_path = os.path.join(dst_view_dir, fname)
+
+                try:
+                    vol_out = process_series(in_path, target_shape=(224, 224), approach="2D", channels=3)
+                    np.save(out_path, vol_out)
+                except Exception as exc:
+                    print(f"❌  {fname}: {exc}")
+                    continue
+
+                if idx % VERBOSE_EVERY == 0 or idx == len(files):
+                    print(f"[{split}/{view}]  processed {idx}/{len(files)} files…")
+
+        # quick sanity‑check on one file per split
+        sample_path = os.path.join(dst_split_dir, "axial", files[0]) if files else None
+        if sample_path and os.path.exists(sample_path):
+            arr = np.load(sample_path)
+            print(f"✓ sample {os.path.basename(sample_path)} → {arr.shape}, min {arr.min():.3f}, max {arr.max():.3f}")

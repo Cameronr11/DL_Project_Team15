@@ -33,7 +33,7 @@ sys.path.append(str(project_root))
 from src.data_loader import MRNetDataset, custom_collate
 from src.data_augmentation_scheduler import DataAugmentationScheduler
 from src.data_augmentation import SimpleMRIAugmentation
-from src.model.MRNetModel import MRNetModel
+from src.experiment_model.MRNetModel import MRNetModel, MRNetEnsemble
 # ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -98,28 +98,58 @@ def class_pos_weight(dataset: MRNetDataset) -> torch.Tensor:
 # ╭────────────────────────────────────────────────────────────────────────────╮
 # │ Training & validation loops                                               │
 # ╰────────────────────────────────────────────────────────────────────────────╯
-def run_epoch(model, loader, criterion, optimizer, scaler,
+def run_epoch(model, loader, criterion, optimizer, scheduler, scaler,
               device, use_amp, train=True, epoch=0, phase="train",
               log_interval=50):
-    if train:
-        model.train()
-    else:
-        model.eval()
+    """
+    One pass over the dataloader.
+
+    Works with:
+      • single-view MRNetModel   (expects a 5-D tensor)      -- default path
+      • TripleMRNet             (expects a dict of 3 views)
+      • any other “ensemble” that accepts a dict of views and has
+        model.backbone_type == "ensemble"
+    """
+    # ------ mode ------------------------------------------------------------
+    model.train() if train else model.eval()
 
     running_loss, y_true, y_pred = 0.0, [], []
     torch.cuda.empty_cache()
 
+    # ------ batches ---------------------------------------------------------
     for step, batch in enumerate(loader, 1):
-        if model.backbone_type != "ensemble" and model.view not in batch["available_views"]:
-            continue
 
-        data   = batch[model.view].to(device, non_blocking=True)
+        # ── 1. Build INPUTS --------------------------------------------------
+        if isinstance(model, MRNetEnsemble):
+            # need all three views for triple-view training
+            needed = ["axial", "coronal", "sagittal"]
+            if not all(v in batch["available_views"] for v in needed):
+                continue                       # skip incomplete case
+
+            inputs = {v: batch[v].to(device, non_blocking=True)
+                      for v in needed}
+
+        elif getattr(model, "backbone_type", None) == "ensemble":
+            # generic dict-style ensemble: pass whatever views exist
+            inputs = {v: batch[v].to(device, non_blocking=True)
+                      for v in batch["available_views"]}
+
+        else:
+            # single-view path (original behaviour)
+            if model.view not in batch["available_views"]:
+                continue
+            inputs = batch[model.view].to(device, non_blocking=True)
+
+        # ── 2. Labels --------------------------------------------------------
         labels = batch["label"].to(device).view(-1, 1)
 
-        with torch.set_grad_enabled(train), autocast(device_type="cuda", enabled=use_amp):
-            outputs = model(data)
+        # ── 3. Forward + loss ------------------------------------------------
+        with torch.set_grad_enabled(train), \
+             autocast(device_type="cuda", enabled=use_amp):
+            outputs = model(inputs)
             loss    = criterion(outputs, labels)
 
+        # ── 4. Optimiser step (if training) ----------------------------------
         if train:
             optimizer.zero_grad(set_to_none=True)
             if use_amp:
@@ -129,14 +159,17 @@ def run_epoch(model, loader, criterion, optimizer, scaler,
             else:
                 loss.backward()
                 optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
+        # ── 5. Track metrics -------------------------------------------------
         running_loss += loss.item()
         y_true.extend(labels.cpu().numpy())
         y_pred.extend(torch.sigmoid(outputs).detach().cpu().numpy())
 
-        # ── per-batch logging ───────────────────────────────────────────────
+        # ------ per-batch logging -------------------------------------------
         if step % log_interval == 0 or step == len(loader):
-            avg_loss = running_loss / step
+            avg_loss  = running_loss / step
             batch_auc = 0.0
             if len(np.unique(y_true)) > 1:
                 try:
@@ -145,7 +178,8 @@ def run_epoch(model, loader, criterion, optimizer, scaler,
                     batch_auc = 0.0
             print(f"   [{phase}  E{epoch:02d}  B{step:04d}/{len(loader)}] "
                   f"loss {avg_loss:.4f}  AUC {batch_auc:.3f}")
-    # ──────────────────────────────────────────────────────────────────────────
+
+    # ------ epoch summary ----------------------------------------------------
     epoch_loss = running_loss / len(loader)
     epoch_auc  = roc_auc_score(y_true, y_pred) if len(np.unique(y_true)) > 1 else 0.0
     return epoch_loss, epoch_auc
@@ -181,10 +215,11 @@ def train(args) -> float:
 
     # ── Data ────────────────────────────────────────────────────────────────
     root = args.data_dir or get_project_root()
+    view_arg = None if args.train_approach == "ensemble" else args.view
     train_ds = MRNetDataset(root, args.task, "train", transform=None,
-                            max_slices=args.max_slices, view=args.view)
+                            max_slices=args.max_slices, view=view_arg)
     val_ds   = MRNetDataset(root, args.task, "valid", transform=None,
-                            max_slices=args.max_slices, view=args.view)
+                            max_slices=args.max_slices, view=view_arg)
     
 
     #this is an attempt to fix the class imbalance issue however creating a toggle beacause this could be a culprit for the drop in performance accuracy found in 4/22 updates
@@ -218,27 +253,78 @@ def train(args) -> float:
                               collate_fn=custom_collate)
 
     # ── Model ───────────────────────────────────────────────────────────────
-    model = MRNetModel(backbone=args.backbone, train_backbone=False, use_attention=not args.no_attention).to(device)
+    if args.train_approach == "ensemble":
+        model = MRNetEnsemble(backbone=args.backbone,
+                            train_backbone=False,
+                            use_attention=not args.no_attention).to(device)
+    else:
+        model = MRNetModel(backbone=args.backbone,
+                        train_backbone=False,
+                        use_attention=not args.no_attention).to(device)
+        model.view = args.view or "axial"
 
-    model.view = args.view
-    unfreeze_at = max(2, args.epochs // 8)  # Unfreeze much earlier
+    # -----------------------------------------------------------------------
+    #  Backbone-training policy  (← new with --backbone_mode)
+    # -----------------------------------------------------------------------
+    if args.backbone_mode == "full":
+        for p in model.parameters():                     # everything trainable
+            p.requires_grad = True
+        BACKBONE_LR      = args.lr * 0.1                # but still lower than head
+        unfreeze_at      = full_unfreeze_at = 10**9     # never trigger later
+        print("🟢  Training the entire backbone from epoch 0")
 
-    # Define a second unfreeze point for complete unfreezing
-    full_unfreeze_at = max(5, args.epochs // 3)
+    elif args.backbone_mode == "frozen":
+        BACKBONE_LR      = 0.0                          # stays frozen
+        unfreeze_at      = full_unfreeze_at = 10**9
+        print("🔒  Backbone will remain frozen for all epochs")
 
-    head_params     = list(model.classifier.parameters()) + list(model.slice_attn.parameters())
-    backbone_params = list(model.feature_extractor.parameters())        # all backbone layers
+    else:                                               # "partial"  (default)
+        BACKBONE_LR      = args.lr * 0.01               # tiny LR until unfreeze
+        unfreeze_at      = max(2,  args.epochs // 8)    # same as before
+        full_unfreeze_at = max(5,  args.epochs // 3)
+        print(f"🌓  Partial unfreeze: at {unfreeze_at} / {full_unfreeze_at}")
+
+    # -----------------------------------------------------------------------
+    #  Parameter groups
+    # -----------------------------------------------------------------------
+    # ─── 1. Split backbone vs head parameters ────────────────────────────────
+    if args.train_approach == "ensemble":
+        head_params = list(model.classifier.parameters())
+        for sub in (model.axial, model.coronal, model.sagittal):
+            head_params += list(sub.slice_attn.parameters())
+        backbone_params = []
+        for sub in (model.axial, model.coronal, model.sagittal):
+            backbone_params += list(sub.feature_extractor.parameters())
+    else:
+        head_params     = list(model.classifier.parameters()) + list(model.slice_attn.parameters())
+        backbone_params = list(model.feature_extractor.parameters())
+
+    # ─── 2. Learning-rate strategy driven by CLI --lr ────────────────────────
+    HEAD_MAX_LR     = args.lr               # e.g. 3e-4
+    BACKBONE_MAX_LR = args.lr / 3.0         # e.g. 1e-4
 
     optimizer = torch.optim.AdamW(
-        [ {"params": backbone_params, "lr": args.lr * 0.01},  # Small but non-zero LR instead of freezing
-          {"params": head_params,     "lr": args.lr} ],
-        weight_decay=args.weight_decay
+        [
+            {"params": backbone_params, "lr": BACKBONE_MAX_LR},
+            {"params": head_params,     "lr": HEAD_MAX_LR},
+        ],
+        weight_decay=args.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=4, factor=0.5, verbose=True
+
+    # One-Cycle LR schedule: warm-up 10 % then cosine decay to 0
+    steps_per_epoch = len(train_loader)
+    total_steps     = args.epochs * steps_per_epoch
+
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[BACKBONE_MAX_LR, HEAD_MAX_LR],  # order matches param groups
+        total_steps=total_steps,
+        pct_start=0.10,
     )
+
     scaler  = GradScaler()
     use_amp = True
+
 
     # ── Logging ─────────────────────────────────────────────────────────────
     os.makedirs(args.output_dir, exist_ok=True)
@@ -256,11 +342,8 @@ def train(args) -> float:
 
         if epoch == unfreeze_at:
             print(f"🔓  Unfreezing top 70% of backbone at epoch {epoch}")
-            model.unfreeze(0.70)                          # enable grads on top 70%
-            # increase backbone learning rate
-            backbone_lr = args.lr * 0.1                   # higher LR for adaptation
-            optimizer.param_groups[0]["lr"] = backbone_lr
-            print(f"    Backbone learning-rate set to {backbone_lr:g}")
+            model.unfreeze(0.70)
+            # don’t change learning-rate – One-CycleLR keeps control
 
         if epoch == full_unfreeze_at:
             print(f"🔓  Unfreezing all backbone layers at epoch {epoch}")
@@ -271,14 +354,22 @@ def train(args) -> float:
             print(f"    Backbone learning-rate set to {backbone_lr:g}")
 
         t0 = time.time()
-        train_loss, train_auc = run_epoch(model, train_loader, criterion, optimizer, scaler,
-                                          device, use_amp, train=True,  epoch=epoch,
-                                          phase="train", log_interval=args.log_interval)
-        val_loss,   val_auc   = run_epoch(model, val_loader,   criterion, optimizer, scaler,
-                                          device, use_amp, train=False, epoch=epoch,
-                                          phase="val",   log_interval=args.log_interval)
+        train_loss, train_auc = run_epoch(
+            model, train_loader, criterion,
+            optimizer, scheduler, scaler,      # ← correct order
+            device, use_amp, train=True, epoch=epoch,
+            phase="train", log_interval=args.log_interval
+        )
 
-        scheduler.step(val_loss)
+        # VAL
+        val_loss, val_auc = run_epoch(
+            model, val_loader, criterion,
+            optimizer, None, scaler,           # scheduler=None for validation
+            device, use_amp, train=False, epoch=epoch,
+            phase="val", log_interval=args.log_interval
+        )
+
+        
 
         writer.add_scalars("Loss", {"train": train_loss, "val": val_loss}, epoch)
         writer.add_scalars("AUC",  {"train": train_auc,  "val": val_auc},  epoch)
@@ -321,9 +412,10 @@ def get_parser():
     p.add_argument("--data_dir", type=str, default=None)
     p.add_argument("--task", type=str, default="abnormal",
                    choices=["abnormal", "acl", "meniscus"])
-    p.add_argument("--view", type=str, required=True,
+    p.add_argument("--view", type=str, default=None,
                    choices=["axial", "coronal", "sagittal"])
     p.add_argument("--max_slices", type=int, default=32)
+    p.add_argument("--train_approach", default="per_view", choices=["per_view", "ensemble"])
     # Model
     p.add_argument("--backbone", type=str, default="resnet18",
                    choices=["alexnet", "resnet18", "resnet34", "densenet121"])
@@ -341,7 +433,7 @@ def get_parser():
     p.add_argument("--use_simple_da", action="store_true",
                   help="Use simple data augmentation with fixed parameters")
     # Early stop
-    p.add_argument("--early_stopping_patience", type=int, default=3)
+    p.add_argument("--early_stopping_patience", type=int, default=4)
     p.add_argument("--early_stopping_delta", type=float, default=0.003)
     # Misc
     #this flag is used to disable class-imbalance weighting in BCE loss
@@ -350,6 +442,8 @@ def get_parser():
     p.add_argument("--output_dir", type=str, default="results/run1")
     p.add_argument("--no_attention", action="store_true",
                help="Disable slice attention and use uniform pooling instead")
+    
+    p.add_argument("--backbone_mode", type=str, default="partial", choices=["partial", "full", "frozen"],)
 
     return p
 
@@ -359,7 +453,8 @@ def get_parser():
 # ╰────────────────────────────────────────────────────────────────────────────╯
 if __name__ == "__main__":
     args = get_parser().parse_args()
-
+    if args.train_approach == "per_view" and args.view is None:
+        raise ValueError("--view must be provided when --train_approach is 'per_view'")
     # Check for incompatible augmentation options
     if args.use_da_scheduler and args.use_simple_da:
         raise ValueError("Cannot use both --use_da_scheduler and --use_simple_da together. Please choose one.")

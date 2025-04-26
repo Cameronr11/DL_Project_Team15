@@ -12,8 +12,10 @@ training stability and ultimately leads to better generalization.
 
 from typing import Callable, Union
 import logging
-from src.data_augmentation import SimpleMRIAugmentation, MRIAugmentationPipeline
+from src.data_augmentation import ( SimpleMRIAugmentation, MRIAugmentationPipeline, GaussianBlur, RandomCutout)
 import torch
+
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -118,29 +120,36 @@ class DataAugmentationScheduler:
             logger.info(f"Epoch {epoch}: Phase 1 - No augmentation")
             return self.no_aug
         
-        # Phase 2: Progressive augmentation
+        # Phase 2: Progressive **strong** augmentation
         elif epoch < self.p2_end:
-            # Calculate how far we are through phase 2 (0-1)
-            alpha = self._interp(epoch, self.p1_end, self.p2_end)
-            
-            # Create augmentation with strength proportional to progress
-            aug = SimpleMRIAugmentation(
-                p=0.3 + 0.5 * alpha,  # Start with p=0.3 instead of 0.2
-                rotation_degrees=max(1.0, self.max_rot * alpha),  # Minimum 1° rotation
-                brightness_factor=max(0.01, self.max_brightness * alpha),  # Minimum 1% brightness
+            alpha = self._interp(epoch, self.p1_end, self.p2_end)   # 0 → 1
+
+            # linearly ramp probability & intensity
+            p_now = 0.4 + 0.5 * alpha           # 0.4 → 0.9
+            rot   = max(3.0, 15.0 * alpha)      # 3° → 15°
+            bri   = max(0.02, 0.15 * alpha)     # 2 % → 15 %
+
+            pipeline = MRIAugmentationPipeline(
+                [
+                    SimpleMRIAugmentation(
+                        p=p_now,
+                        rotation_degrees=rot,
+                        brightness_factor=bri,
+                    ),
+                    GaussianBlur(p=0.3),                 # ← extra blur
+                    RandomCutout(frac=0.25, p=0.4),      # ← small cut-out
+                ]
             )
-            
-            # Use MRIAugmentationPipeline to wrap the augmentation
-            pipeline = MRIAugmentationPipeline([aug])
-            
-            # Add properties to the pipeline for logging
-            pipeline.p = aug.p
-            pipeline.rotation_degrees = aug.rotation_degrees
-            pipeline.brightness_factor = aug.brightness_factor
-            
-            logger.info(f"Epoch {epoch}: Phase 2 - Progressive augmentation (p={aug.p:.2f}, "
-                        f"rot={aug.rotation_degrees:.2f}°, brightness=±{aug.brightness_factor*100:.2f}%)")
-            
+
+            # (optional) add attributes for debugging
+            pipeline.p = p_now
+            pipeline.rotation_degrees = rot
+            pipeline.brightness_factor = bri
+
+            logger.info(
+                "Epoch %d: Phase 2 – p=%.2f  rot=±%.1f°  bri=±%.1f%%",
+                epoch, p_now, rot, bri * 100
+            )
             return pipeline
         
         # Phase 3: No augmentation again

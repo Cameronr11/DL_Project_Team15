@@ -6,7 +6,7 @@ import os
 import gc
 from torch.utils.data import DataLoader
 from src.data_loader import MRNetDataset
-from src.experiment_model.MRNetModel import MRNetModel
+from src.experiment_model.MRNetModel import MRNetModel, MRNetEnsemble
 import json
 import argparse
 from src.experiment_model.train_multi_gpu import get_project_root
@@ -19,45 +19,44 @@ def test_model(args, model, device, test_loader, criterion):
     Evaluate model on test set
     """
     model.eval()
-    test_loss = 0
-    test_pred = []
-    test_true = []
-    total_samples = 0
-    
-    print("\nStarting testing process...")
-    with torch.no_grad():
-        for i, batch in enumerate(test_loader):
-            # Print progress
-            if i % 10 == 0:
-                print(f"Processing batch {i+1}/{len(test_loader)}")
-            
-            # Get labels
-            labels = batch['label'].to(device)
-            labels = labels.view(-1, 1)
-            
-            if args.train_approach == 'per_view':
-                if args.view not in batch['available_views']:
-                    continue
-                
-                data = batch[args.view].to(device)
-                outputs = model(data)
-            else:  # ensemble
-                data_dict = {view: batch[view].to(device) for view in batch['available_views']}
-                outputs = model(data_dict)
-            
-            # Calculate loss
-            loss = criterion(outputs, labels)
-            test_loss += loss.item()
-            
-            # Store predictions and true labels
-            test_pred.extend(torch.sigmoid(outputs).cpu().numpy())
-            test_true.extend(labels.cpu().numpy())
-            total_samples += labels.size(0)
-            
-            # Free up memory
-            del data, outputs, labels
-            torch.cuda.empty_cache()
-            gc.collect()
+    test_loss, test_pred, test_true, total_samples = 0.0, [], [], 0
+    print(f"begining testing")
+    torch.cuda.empty_cache()
+    for i, batch in enumerate(test_loader):
+        # Print progress
+        if i % 10 == 0:
+            print(f"Processing batch {i+1}/{len(test_loader)}")
+        labels = batch['label'].to(device).view(-1, 1)
+
+        if args.train_approach == 'per_view':
+            if args.view not in batch['available_views']:
+                print(f"Skipping batch {i+1} because {args.view} is not in {batch['available_views']}")
+                continue
+            inputs = batch[args.view].to(device)
+        else:  # ensemble
+            needed_views = ['axial', 'coronal', 'sagittal']
+            if not all(view in batch['available_views'] for view in needed_views):
+                print(f"Skipping batch {i+1} because {needed_views} is not in {batch['available_views']}")
+                continue
+            inputs = {view: batch[view].to(device) for view in needed_views}
+
+        # ── forward pass (works for both paths) ───────────────────────────────
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            outputs = model(inputs)
+
+        
+        # Calculate loss
+        loss = criterion(outputs, labels)
+        test_loss += loss.item()
+        
+        # Store predictions and true labels
+        test_pred.extend(torch.sigmoid(outputs).cpu().numpy())
+        test_true.extend(labels.cpu().numpy())
+        total_samples += labels.size(0)
+        
+        # Free up memory
+        del inputs, outputs, labels
+        gc.collect()
     
     # Calculate metrics
     test_auc = roc_auc_score(test_true, test_pred)
@@ -144,8 +143,10 @@ def main():
     # Add the same arguments as training script
     parser.add_argument('--task', type=str, required=True,
                       choices=['abnormal', 'acl', 'meniscus'])
-    parser.add_argument('--view', type=str, required=True,
+    
+    parser.add_argument('--view', type=str, default=None,
                       choices=['axial', 'coronal', 'sagittal'])
+    
     parser.add_argument('--model_path', type=str, required=True,
                       help='Path to saved model')
     parser.add_argument('--batch_size', type=int, default=1)
@@ -166,6 +167,8 @@ def main():
     parser.add_argument('--no_pos_weight', action='store_true',
                     help='Keep the test loss consistent with train by disabling/using pos_weight')
     args = parser.parse_args()
+    if args.train_approach == "per_view" and args.view is None:
+        parser.error("--view is required when --train_approach is 'per_view'")
     
     # Setup output directory
     if args.output_dir is None:
@@ -207,7 +210,10 @@ def main():
     print(f"Test dataset size: {len(test_dataset)}")
     
     # Create custom collate function that only processes the needed view
-    collate_fn = lambda batch: selective_collate(batch, args.view if args.train_approach == 'per_view' else None)
+    if args.train_approach == "per_view":
+        collate_fn = lambda batch: selective_collate(batch, args.view)
+    else:
+        collate_fn = lambda batch: selective_collate(batch, None)
     
     test_loader = DataLoader(
         test_dataset,
@@ -220,7 +226,12 @@ def main():
     
     # Load model
     print(f"Loading model from {args.model_path}...")
-    model = MRNetModel(backbone=args.backbone)
+    if args.train_approach == "ensemble":
+        model = MRNetEnsemble(backbone=args.backbone)
+    else:
+        model = MRNetModel(backbone=args.backbone)
+
+
     model.load_state_dict(torch.load(args.model_path))
     model = model.to(device)
     model.eval()  # Set model to evaluation mode
@@ -251,7 +262,7 @@ def main():
     metric_tracker = MetricTracker(
         model_name=model_name,
         task=args.task,
-        view=args.view,
+        view=args.view or 'ensemble',
         config=vars(args),
         output_dir=args.output_dir
     )

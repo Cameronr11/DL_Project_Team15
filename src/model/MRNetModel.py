@@ -90,6 +90,30 @@ class MRNetModel(nn.Module):
             if i / total >= 1 - pct:
                 p.requires_grad = True
 
+
+    #this is for the ensemble model
+    def forward_features(self, x):
+        """
+        Return the pooled slice embedding (mean + max → 2·C′) **without**
+        passing through the final classifier.  Used by TripleMRNet.
+        """
+        # x shape (B, S, C, H, W)
+        B, S, C, H, W = x.shape
+        x = x.view(B * S, C, H, W)
+
+        feats = self.feature_extractor(x)          # (B·S, C′, h, w)
+        feats = self.global_pool(feats).flatten(1) # (B·S, C′)
+        feats = feats.view(B, S, -1)               # (B, S, C′)
+
+        if self.use_attention:
+            attn = self.slice_attn(feats).softmax(dim=1)   # (B, S, 1)
+            mean_pool = (feats * attn).sum(dim=1)          # (B, C′)
+        else:
+            mean_pool = feats.mean(dim=1)                  # (B, C′)
+
+        max_pool = feats.max(dim=1).values                 # (B, C′)
+        return torch.cat([mean_pool, max_pool], dim=1)     # (B, 2·C′)
+
     def forward(self, x):
         # x shape  (B, S, C, H, W)
         B, S, C, H, W = x.shape
@@ -111,4 +135,72 @@ class MRNetModel(nn.Module):
         pooled = torch.cat([mean_pool, max_pool], dim=1)         # (B, 2C')
 
         return self.classifier(pooled)
+    
+
+
+
+class MRNetEnsemble(nn.Module):
+    """
+    A thin wrapper that holds three MRNetModel backbones (one per view)
+    and concatenates their pooled embeddings before the final classifier.
+    All three share the *same* architecture but **do not** share weights
+    (this matches the Stanford baseline & leaderboard repo).
+    """
+    def __init__(self,
+                    backbone: str = "resnet18",
+                    train_backbone: bool = False,
+                    use_attention: bool = True,
+                    fusion_dim: int | None = None):
+        super().__init__()
+
+        # 1. Three independent sub-nets
+        self.axial     = MRNetModel(backbone, train_backbone, use_attention)
+        self.coronal   = MRNetModel(backbone, train_backbone, use_attention)
+        self.sagittal  = MRNetModel(backbone, train_backbone, use_attention)
+
+        # 2. Fusion head (linear ⇒ sigmoid)
+        per_view_dim = self.axial.feature_dim * 2   # mean+max
+        self.fusion_dim = 3 * per_view_dim if fusion_dim is None else fusion_dim
+        self.classifier = nn.Sequential(
+            nn.BatchNorm1d(3 * per_view_dim),
+            nn.Dropout(0.5),
+            nn.Linear(3 * per_view_dim, 1)
+        )
+
+
+    def unfreeze(self, pct: float = 1.0):
+        """
+        Mirror the single-view API so the trainer can call
+        model.unfreeze(pct) without knowing the model type.
+
+        pct ∈ (0, 1] == fraction of backbone layers to unfreeze
+                1.0  == unfreeze everything
+        """
+        for sub in (self.axial, self.coronal, self.sagittal):
+            sub.unfreeze(pct)
+
+
+    def forward(self, x_dict: dict[str, torch.Tensor]):
+        """
+        x_dict  keys: 'axial', 'coronal', 'sagittal'
+                    each tensor is (B, S, C, H, W)
+        """
+        feats = []
+        for view, subnet in zip(["axial", "coronal", "sagittal"],
+                                [self.axial, self.coronal, self.sagittal]):
+            if view not in x_dict:
+                raise KeyError(f"Missing view '{view}' in batch")
+            feats.append(subnet.forward_features(x_dict[view]))  # see helper below
+
+        fused = torch.cat(feats, dim=1)              # (B, 3*feat)
+        return self.classifier(fused)
+
+    # ------------------------------------------------------------------  
+    # Small shim so we can re-use pooling from MRNetModel without logits
+    # ------------------------------------------------------------------  
+    def forward_features(self, x):
+        return self.axial.forward_features(x)  # any subnet works
+
+
+
 

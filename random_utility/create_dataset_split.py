@@ -11,8 +11,9 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
 def get_project_root():
-    """Returns the absolute path to the project root directory"""
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    """Returns the *true* project root directory (one level above src)."""
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def create_and_organize_split(root_dir, test_size=0.2, random_state=42):
     """
