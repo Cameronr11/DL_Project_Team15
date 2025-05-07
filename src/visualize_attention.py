@@ -7,7 +7,7 @@ from src.experiment_model.MRNetModel import MRNetModel
 from src.data_normalization import process_series
 
 # ========== Config ==========
-MODEL_PATH = "src/results/attention_experiment/simple_da_use_attention_experiment/meniscus_axial/best_model.pth"
+MODEL_PATH = "src/results/best_model_attempt/resnet18_da_schedule_no_weight_decay/abnormal_axial/best_model.pth"
 RAW_DATA_PATH  = "data/MRNet-v1.0/processed_train_data/axial/0029.npy"
 MAX_SLICES = 32
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -18,7 +18,7 @@ volume_tensor = torch.tensor(volume).unsqueeze(0).float().to(DEVICE)  # (1, S, C
 
 
 # ========== Load Model ==========
-model = MRNetModel(backbone="densenet121", use_attention=True).to(DEVICE)
+model = MRNetModel(backbone="resnet18", use_attention=True).to(DEVICE)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
 model.eval()
 
